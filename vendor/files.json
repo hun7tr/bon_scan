@@ -1,0 +1,14 @@
+[
+ "vendor/lang/deu.traineddata.gz",
+ "vendor/tesseract-core/tesseract-core-lstm.js",
+ "vendor/tesseract-core/tesseract-core-lstm.wasm",
+ "vendor/tesseract-core/tesseract-core-lstm.wasm.js",
+ "vendor/tesseract-core/tesseract-core-relaxedsimd-lstm.js",
+ "vendor/tesseract-core/tesseract-core-relaxedsimd-lstm.wasm",
+ "vendor/tesseract-core/tesseract-core-relaxedsimd-lstm.wasm.js",
+ "vendor/tesseract-core/tesseract-core-simd-lstm.js",
+ "vendor/tesseract-core/tesseract-core-simd-lstm.wasm",
+ "vendor/tesseract-core/tesseract-core-simd-lstm.wasm.js",
+ "vendor/tesseract/tesseract.min.js",
+ "vendor/tesseract/worker.min.js"
+]
