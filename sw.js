@@ -12,7 +12,8 @@ self.addEventListener('install', e => {
     try {
       const r = await fetch('vendor/files.json', { cache: 'no-store' });
       if (r.ok) {
-        const files = await r.json();
+        // nur was ein iPhone braucht: Skripte, Sprachmodell und die Kern-Varianten mit eingebettetem WebAssembly (ohne relaxed SIMD)
+        const files = (await r.json()).filter(f => !/tesseract-core/.test(f) || (/\.wasm\.js$/.test(f) && !/relaxedsimd/.test(f)));
         const oc = await caches.open(OCR_CACHE);
         for (const f of files) { if (!(await oc.match(f))) { try { await oc.add(f); } catch (err) {} } }
       }

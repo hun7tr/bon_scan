@@ -23,7 +23,7 @@
   }
 
   // Betrag am Zeilenende: „BANANE 1,29 A“, „PFAND -0,25 B“, „RABATT 0,50-“, „SUMME EUR 12,34“
-  const END_PRICE = /^(.*?)[\s:]*(-|−)?\s*(\d{1,4}),(\d{2})\s*(-)?\s*(?:€|EUR)?\s*(?:[A-Z]{1,2}\d?|\d|\*)?\s*\*?$/;
+  const END_PRICE = /^(.*?)[\s:]*(-|−)?\s*(\d{1,4}),(\d{2})\d?\s*(-)?\s*(?:€|EUR)?\s*(?:[A-Z]{1,2}\d?|\d|\*)?[\s*;:,.'`´|_~°^"]*$/;
   // Menge: „2 x 0,89“, „2 Stk x 0,89 1,78“, „3 * 1,29“
   const QTY = /^(\d{1,3})\s*(?:STK|ST|STUCK|STÜCK|STCK)?\.?\s*[xX×*]\.?\s*(\d{1,4},\d{2})(?:\s*(?:EUR|€))?(?:\s+(-?\d{1,4},\d{2}))?/i;
   const QTY_INLINE = /(?:^|\s)(\d{1,3})\s*(?:STK|ST)?\.?\s*[xX×*]\.?\s*(\d{1,4},\d{2})(?=\s|$)|^(\d{1,3})\s*[xX×*]\s+(?=[A-Za-zÄÖÜäöü])/i;
@@ -75,6 +75,13 @@
     return first ? prettyName(first).slice(0, 40) : null;
   }
 
+  function fixPart(str, min, max) {
+    for (let i = 0; i < str.length; i++) for (const r of CONFUSE[str[i]] || '') {
+      const v = +(str.slice(0, i) + r + str.slice(i + 1));
+      if (v >= min && v <= max) return v;
+    }
+    return null;
+  }
   function findDate(lines, now) {
     now = now || Date.now();
     const re = /(\d{1,2})\s*[.\/-]\s*(\d{1,2})\s*[.\/-]\s*(\d{4}|\d{2})(?!\d)/g;
@@ -86,7 +93,10 @@
       while ((m = re.exec(fixed))) {
         let d = +m[1], mo = +m[2], y = +m[3];
         if (y < 100) y += 2000;
-        if (d < 1 || d > 31 || mo < 1 || mo > 12 || y < 2000) continue;
+        // „93.11.2026“: Tag oder Monat mit einer typisch verwechselten Ziffer reparieren
+        if (d < 1 || d > 31) d = fixPart(m[1], 1, 31);
+        if (mo < 1 || mo > 12) mo = fixPart(m[2], 1, 12);
+        if (!d || !mo || y < 2000) continue;
         const timeRe = /(\d{1,2})\s*:\s*(\d{2})/;
         const tm = fixed.slice(m.index + m[0].length).match(timeRe) || fixed.match(timeRe) || (lines[li + 1] || '').match(timeRe) || (lines[li - 1] || '').match(timeRe);
         const hh = tm && +tm[1] < 24 ? +tm[1] : 12, mm = tm && +tm[2] < 60 ? +tm[2] : 0;
@@ -217,6 +227,14 @@
       const diff = round2(sum - total);
       const hits = items.filter(it => digitVariants(it.price).some(v => Math.abs(v - (it.price - diff)) < 0.005));
       if (hits.length === 1) { hits[0].price = round2(hits[0].price - diff); hits[0].fixed = true; sum = round2(total); }
+      else if (!hits.length && items.length <= 60) {
+        // zwei falsch gelesene Preise: nur übernehmen, wenn es genau eine passende Kombination gibt
+        const opts = items.map(it => digitVariants(it.price).map(v => ({ it, v, delta: round2(it.price - v) })));
+        const sols = [];
+        for (let a = 0; a < opts.length && sols.length < 2; a++) for (let b = a + 1; b < opts.length && sols.length < 2; b++)
+          for (const x of opts[a]) for (const y of opts[b]) if (Math.abs(x.delta + y.delta - diff) < 0.005) sols.push([x, y]);
+        if (sols.length === 1) { sols[0].forEach(o => { o.it.price = o.v; o.it.fixed = true; }); sum = round2(total); }
+      }
     }
     const res = {
       store: findStore(lines),
@@ -287,7 +305,7 @@
       }
     }
     // zusammengesetzte Produkte: „Pizza Salami“ ist Fleisch, „Eiernudeln“ vegetarisch
-    if (out.src === 'dict' && out.cat !== 'pflanzlich' && out.cat !== 'obst') {
+    if (out.src === 'dict' && !['pflanzlich', 'obst', 'fisch', 'fleisch'].includes(out.cat)) {
       const cats = new Set(matches.map(r => r.c));
       if (cats.has('fleisch')) out.diet = 'fleisch';
       else if (cats.has('fisch')) out.diet = 'fisch';
