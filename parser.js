@@ -455,7 +455,18 @@
     return out;
   }
 
-  const api = { parse, categorize, learnKey, prettyName, norm };
+  // eine einzelne Zeile vom Bon in Name und Preis zerlegen (für „Artikel hinzufügen“ per Antippen)
+  function guessLine(text, learned) {
+    const t = fixNumbers(String(text || '').replace(/\s+/g, ' ').trim());
+    const ep = endPrice(t);
+    let name = ep ? ep.name : t;
+    const wi = name.match(WEIGHT_INLINE);
+    if (wi) name = (name.slice(0, wi.index) + name.slice(wi.index + wi[0].length)).trim();
+    const c = categorize(name, learned);
+    return Object.assign({ raw: cleanName(name), name: c.name && c.src === 'learned' ? c.name : prettyName(name), price: ep ? round2(ep.price) : null }, c.ignore ? { cat: 'unbekannt' } : c);
+  }
+
+  const api = { parse, categorize, guessLine, learnKey, prettyName, norm };
   root.BonParser = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);

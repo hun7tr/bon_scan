@@ -1,6 +1,6 @@
 /* Offline: App-Dateien werden beim Installieren gespeichert. Mit Verbindung kommt die neueste Fassung, sonst die gespeicherte.
    Die Texterkennung (vendor/ bzw. CDN) ändert sich nicht und wird immer aus dem Speicher geladen, sobald sie einmal da ist. */
-const CACHE = 'bon-scan-v2';
+const CACHE = 'bon-scan-v3';
 const OCR_CACHE = 'bon-scan-ocr-v1';
 const ASSETS = ['./', 'index.html', 'styles.css', 'data.js', 'parser.js', 'ocr.js', 'changelog.js', 'app.js', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 

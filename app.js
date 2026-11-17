@@ -2,7 +2,7 @@
 (function () {
 
   // ------------------------------------------------------------ Konstanten
-  const VERSION = '0.2';
+  const VERSION = '0.3';
   const THEMES = { hell: { bar: '#F0EEE9', name: 'Hell' }, dunkel: { bar: '#161617', name: 'Dunkel' } };
   const D = window.BON_DATA, P = window.BonParser, OCR = window.BonOCR;
   const TRASH_DAYS = 30, DAY = 864e5, HOLD_MS = 1000;
@@ -14,6 +14,11 @@
   const S = { receipts: [], learned: {}, settings: { theme: 'hell', keepPhotos: true, range: 'month', store: null, from: null, to: null } };
 
   // ------------------------------------------------------------ Helfer
+  // null und false in Kinderlisten überspringen (sonst erscheint „null“ als Text)
+  ['append', 'replaceChildren'].forEach(fn => {
+    const orig = Element.prototype[fn];
+    Element.prototype[fn] = function (...a) { return orig.apply(this, a.filter(x => x != null && x !== false)); };
+  });
   function h(tag, attrs, ...kids) {
     const el = document.createElement(tag);
     if (attrs) for (const k in attrs) {
@@ -86,12 +91,15 @@
   const keyOf = it => P.learnKey(it.raw || it.name);
 
   let toastTimer;
-  function toast(msg) {
+  // Kurzmeldung; mit undo erscheint daneben „Rückgängig“ und die Meldung bleibt etwas länger stehen
+  function toast(msg, undo) {
     const el = document.getElementById('toast');
-    el.textContent = msg;
+    el.replaceChildren(h('span', null, msg));
+    el.classList.toggle('has-action', !!undo);
+    if (undo) el.append(h('button', { class: 'toast-action', 'data-act': 'undo', onclick: () => { el.classList.remove('show'); clearTimeout(toastTimer); haptic(); undo(); } }, 'Rückgängig'));
     el.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+    toastTimer = setTimeout(() => el.classList.remove('show'), undo ? 6000 : 2200);
   }
 
   // leichtes haptisches Feedback: Vibration auf Android, auf dem iPhone über einen unsichtbaren Schalter
@@ -569,7 +577,7 @@
   function startReceipt(canvas) {
     const d = emptyReceipt();
     d.date = Date.now();
-    const ctx = { isNew: true, reading: true, progress: 0, phase: 'prep', photos: [], error: null, canvas };
+    const ctx = { isNew: true, reading: true, progress: 0, phase: 'prep', photos: [], scans: [], error: null, canvas };
     openReceipt(d, ctx);
   }
 
@@ -607,6 +615,15 @@
       const results = await OCR.recognize(canvas, p => { ctx.phase = 'read'; ctx.progress = p; sheet.render(); });
       const { parsed, res } = bestParse(results);
       d.text = (d.text ? d.text + '\n\n' : '') + res.text.trim();
+      // das bearbeitete Bild mit allen erkannten Zeilen aufheben: damit sieht man später, was noch fehlt
+      const si = (d.scans || []).length + ctx.scans.length;
+      const sc = Math.min(1, 1000 / res.image.width);
+      const box = b => b ? [b.x0, b.y0, b.x1, b.y1].map(v => Math.round(v * sc)) : null;
+      ctx.scans.push({
+        blob: await OCR.thumbBlob(res.image, 1000),
+        w: Math.round(res.image.width * sc), h: Math.round(res.image.height * sc),
+        lines: res.lines.map(l => ({ t: l.text, b: box(l.bbox) }))
+      });
       if (!d.store && parsed.store) d.store = parsed.store;
       if (parsed.date && (!d.date || ctx.firstScan !== false)) d.date = parsed.date;
       if (parsed.totalFound) d.total = parsed.total;
@@ -614,6 +631,7 @@
         it.id = uid();
         // Zeilenausschnitt nur für Artikel, bei denen der Nutzer nachsehen soll
         if (it.check && it.check.includes('lesen') || it.check && it.check.includes('preis')) it.crop = OCR.lineCrop(it._img || res.image, it.bbox);
+        it.si = si; it.b = box(it.bbox);
         ['bbox', 'line', 'minWord', 'conf', 'unreadable', '_img'].forEach(k => delete it[k]);
         d.items.push(it);
       });
@@ -633,6 +651,7 @@
 
   function openReceipt(src, ctx) {
     ctx = ctx || { isNew: false };
+    ctx.scans = ctx.scans || [];
     const d = ctx.isNew ? src : JSON.parse(JSON.stringify(src));
     const startJson = ctx.isNew ? null : JSON.stringify(d);
     let dirty = () => ctx.isNew ? !ctx.reading : JSON.stringify(d) !== startJson;
@@ -652,6 +671,8 @@
       d.open = openChecks(d).length + (d.total == null && d.items.length ? 1 : 0);
       for (const b of ctx.photos || []) { try { d.photoIds.push(await putPhoto(b)); } catch (e) {} }
       ctx.photos = [];
+      for (const sc of ctx.scans) { try { (d.scans = d.scans || []).push({ id: await putPhoto(sc.blob), w: sc.w, h: sc.h, lines: sc.lines }); } catch (e) {} }
+      ctx.scans = [];
       d.updatedAt = Date.now();
       try { await DB.put('receipts', d); } catch (e) { toast('Speichern fehlgeschlagen'); return; }
       const i = S.receipts.findIndex(r => r.id === d.id);
@@ -675,7 +696,7 @@
         sheet.render();
         if (n) toast('Gemerkt · ' + n + ' weitere ' + (n === 1 ? 'Artikel' : 'Artikel') + ' angepasst');
       },
-      onDelete: () => { d.items = d.items.filter(x => x !== it); sheet.render(); }
+      onDelete: () => removeItem(it)
     });
 
     async function itemMenu(id, el) {
@@ -686,7 +707,13 @@
         { label: 'Löschen', value: 'delete', icon: 'trash', danger: true }
       ], it.name);
       if (a === 'edit') editItem(it);
-      else if (a === 'delete') { d.items = d.items.filter(x => x !== it); sheet.render(); }
+      else if (a === 'delete') removeItem(it);
+    }
+    function removeItem(it) {
+      const at = d.items.indexOf(it);
+      d.items = d.items.filter(x => x !== it);
+      sheet.render();
+      toast('Entfernt', () => { d.items.splice(Math.min(at, d.items.length), 0, it); sheet.render(); });
     }
 
     async function pickStore(e) {
@@ -752,10 +779,7 @@
       itemRows.replaceChildren(...d.items.map(it => itemRow(it, () => editItem(it))));
       if (!d.items.length) itemRows.append(h('div', { class: 'line muted-line' }, 'Keine Artikel'));
       kids.push(itemRows);
-      kids.push(group(h('button', { class: 'line action', 'data-act': 'add-item', onclick: () => {
-        const it = { id: uid(), raw: '', name: '', price: null, qty: 1, cat: 'unbekannt', diet: null, conv: false, health: null, src: 'user' };
-        openItem(it, { isNew: true, onSave: async (next, classChanged) => { Object.assign(it, next); if (!it.raw) it.raw = it.name; d.items.push(it); if (classChanged && it.cat !== 'unbekannt') await learn(it, d.id); sheet.render(); } });
-      } }, icon('plus'), 'Artikel hinzufügen')));
+      kids.push(group(h('button', { class: 'line action', 'data-act': 'add-item', onclick: () => openAddItem(d, ctx, sheet) }, icon('plus'), 'Artikel hinzufügen')));
 
       kids.push(sectionLabel('Bon'));
       kids.push(group(
@@ -901,11 +925,25 @@
           food && dr.cat !== 'unbekannt' ? lineSwitch('Convenience', dr.conv, v => { dr.conv = v; }, 'check-conv') : null
         ));
         kids.push(group(h('button', { class: 'line danger', 'data-act': 'not-item', onclick: async () => {
+          const at = d.items.indexOf(it), stepAt = k, prev = S.learned[keyOf(it)];
           d.items = d.items.filter(x => x !== it);
           await learnIgnore(it);
-          toast('Entfernt · wird künftig übersprungen');
           steps.splice(k, 1);
-          if (!steps.length) { finish(); return; }
+          // Rückgängig: Artikel, Schritt und vorherige Zuordnung wiederherstellen
+          const undo = async () => {
+            d.items.splice(Math.min(at, d.items.length), 0, it);
+            const key = keyOf(it);
+            if (prev) { S.learned[key] = prev; try { await DB.put('learned', prev); } catch (e) {} }
+            else { delete S.learned[key]; try { await DB.del('learned', key); } catch (e) {} }
+            steps.splice(Math.min(stepAt, steps.length), 0, st);
+            parent.render();
+            if (sheet.closed) { toast('Wiederhergestellt'); return; }
+            k = Math.min(stepAt, steps.length - 1);
+            sheet.render();
+          };
+          toast('Kein Artikel', undo);
+          parent.render();
+          if (!steps.length) { sheet.close(); return; }
           if (k >= steps.length) k = steps.length - 1;
           sheet.render();
         } }, 'Kein Artikel')));
@@ -918,6 +956,126 @@
         h('button', { class: 'btn primary', 'data-act': 'check-next', onclick: () => next(false) }, k < steps.length - 1 ? 'Weiter' : 'Fertig'));
     };
     sheet.render();
+  }
+
+  // ------------------------------------------------------------ Artikel hinzufügen mit Blick auf den Bon
+  // Oben der bearbeitete Bon: erfasste Zeilen sind markiert, eine fehlende Zeile antippen übernimmt Name und Preis.
+  function openAddItem(d, ctx, parent) {
+    const dr = { name: '', price: null, qty: 1, cat: 'unbekannt', diet: null, conv: false, health: null, catTouched: false, raw: '' };
+    const sheet = openSheet({
+      title: 'Artikel hinzufügen',
+      beforeClose: async () => {
+        if (!dr.name.trim() && dr.price == null) return true;
+        const a = await askSave('Artikel hinzufügen?');
+        if (a === 'save') { await add(); return false; }
+        return a === 'discard';
+      }
+    });
+    async function add() {
+      if (!dr.name.trim()) { toast('Name fehlt'); return; }
+      if (dr.price == null) { toast('Preis fehlt'); return; }
+      const it = { id: uid(), raw: (dr.raw || dr.name).trim(), name: dr.name.trim(), price: dr.price, qty: dr.qty, cat: dr.cat, diet: dr.diet, conv: dr.conv, health: dr.health, src: 'user' };
+      if (dr.si != null) { it.si = dr.si; it.b = dr.b; }
+      if (it.qty > 1) it.unit = round2(it.price / it.qty);
+      // an der Stelle einsortieren, an der die Zeile auf dem Bon steht
+      let at = d.items.length;
+      if (it.b) { const j = d.items.findIndex(x => (x.si || 0) > it.si || ((x.si || 0) === it.si && x.b && x.b[1] > it.b[1])); if (j >= 0) at = j; }
+      d.items.splice(at, 0, it);
+      if (it.cat !== 'unbekannt') await learn(it, d.id);
+      haptic();
+      sheet.close();
+      parent.render();
+      toast('Hinzugefügt');
+    }
+    const scans = () => [
+      ...(d.scans || []).map((sc, i) => ({ sc, i, url: () => photoUrl(sc.id) })),
+      ...ctx.scans.map((sc, j) => ({ sc, i: (d.scans || []).length + j, url: async () => URL.createObjectURL(sc.blob) }))
+    ];
+    const overlap = (a, b) => a && b && Math.min(a[3], b[3]) - Math.max(a[1], b[1]) > Math.min(a[3] - a[1], b[3] - b[1]) * .5;
+    const view = h('div', { class: 'bon-view' });
+    async function buildView() {
+      const list = scans();
+      if (!list.length) {
+        // ältere Bons ohne bearbeitetes Bild: Foto zeigen, falls vorhanden
+        for (const id of d.photoIds || []) { const u = await photoUrl(id); if (u) view.append(h('img', { src: u, alt: '' })); }
+        for (const b of ctx.photos || []) view.append(h('img', { src: URL.createObjectURL(b), alt: '' }));
+        if (!view.children.length) view.remove();
+        return;
+      }
+      for (const { sc, i, url } of list) {
+        const u = await url();
+        const wrap = h('div', { class: 'bon-scan', style: 'aspect-ratio:' + sc.w + '/' + sc.h }, h('img', { src: u, alt: '' }));
+        sc.lines.forEach(l => {
+          if (!l.b) return;
+          const done = d.items.some(it => it.si === i && overlap(it.b, l.b));
+          const pct = (v, m) => (v / m * 100) + '%';
+          wrap.append(h('button', {
+            class: 'bon-line' + (done ? ' done' : ''), 'aria-label': l.t,
+            style: 'left:' + pct(l.b[0], sc.w) + ';top:' + pct(l.b[1], sc.h) + ';width:' + pct(l.b[2] - l.b[0], sc.w) + ';height:' + pct(l.b[3] - l.b[1], sc.h),
+            onclick: e => {
+              view.querySelectorAll('.bon-line.on').forEach(x => x.classList.remove('on'));
+              e.currentTarget.classList.add('on');
+              haptic();
+              if (done) { toast('Diese Zeile ist schon erfasst'); return; }
+              const g = P.guessLine(l.t, S.learned);
+              Object.assign(dr, { name: g.name, raw: g.raw, price: g.price, si: i, b: l.b });
+              if (!dr.catTouched && g.cat !== 'unbekannt') Object.assign(dr, { cat: g.cat, diet: g.diet, conv: g.conv, health: g.health });
+              renderForm();
+            }
+          }));
+        });
+        view.append(wrap);
+      }
+      // zum Anfang der Artikel springen statt zum Kopf des Bons
+      requestAnimationFrame(() => {
+        const first = view.querySelector('.bon-line.done');
+        if (first) view.scrollTop = Math.max(0, first.offsetTop - 60);
+      });
+    }
+    const form = h('div', { class: 'add-form' });
+    const pick = async (e, key, list, title) => {
+      const a = await popMenu(e.currentTarget, list.map(x => ({ label: x.name, value: x.k == null ? '__null' : x.k, checked: (dr[key] || null) === (x.k || null) })), title);
+      if (a === undefined) return;
+      const v = a === '__null' ? null : a;
+      if (key === 'cat') {
+        const c = catOf(v);
+        dr.cat = v; dr.catTouched = true;
+        if (c.food === false) { dr.diet = null; dr.health = null; dr.conv = false; }
+        else { if (c.d !== undefined) dr.diet = c.d; if (c.h !== undefined) dr.health = c.h; dr.conv = !!c.v; }
+      } else dr[key] = v;
+      renderForm();
+    };
+    function renderForm() {
+      const sum = itemSum(d.items), miss = d.total == null ? null : round2(d.total - sum);
+      const food = catOf(dr.cat).food !== false;
+      form.replaceChildren(
+        miss != null && Math.abs(miss) >= 0.01 ? note(miss > 0 ? 'Es fehlen noch ' + fmtEur(miss) + ' bis zur Summe laut Bon.' : 'Die Artikel liegen ' + fmtEur(-miss) + ' über der Summe laut Bon.') : null,
+        group(
+          line('Name', h('input', { type: 'text', 'data-field': 'add-name', value: dr.name, placeholder: 'Wie heißt das Produkt?', autocomplete: 'off', autocapitalize: 'sentences', enterkeyhint: 'next',
+            oninput: e => { dr.name = e.target.value; },
+            onchange: e => {
+              if (dr.catTouched) return;
+              const g = P.categorize(e.target.value, S.learned);
+              if (!g.ignore && g.cat !== 'unbekannt') { Object.assign(dr, { cat: g.cat, diet: g.diet, conv: g.conv, health: g.health }); renderForm(); }
+            } })),
+          line('Preis', h('span', { class: 'euro-field' }, euroInput(dr.price, n => { dr.price = n; }, 'add-price'), h('span', null, '€'))),
+          line('Menge', h('span', { class: 'stepper-s' },
+            h('button', { type: 'button', 'aria-label': 'Weniger', onclick: e => { e.preventDefault(); if (dr.qty > 1) { dr.qty--; renderForm(); } } }, '−'),
+            h('span', { class: 'step-num' }, dr.qty),
+            h('button', { type: 'button', 'aria-label': 'Mehr', onclick: e => { e.preventDefault(); dr.qty++; renderForm(); } }, '+')))
+        ),
+        group(
+          lineBtn('Kategorie', dr.cat === 'unbekannt' ? 'Wählen' : catOf(dr.cat).name, e => pick(e, 'cat', D.CATS.filter(x => x.k !== 'unbekannt'), 'Kategorie'), { 'data-act': 'add-cat' }),
+          food && dr.cat !== 'unbekannt' ? lineBtn('Ernährung', dietName(dr.diet), e => pick(e, 'diet', D.DIETS, 'Ernährung'), { 'data-act': 'add-diet' }) : null,
+          food && dr.cat !== 'unbekannt' ? lineSwitch('Convenience', dr.conv, v => { dr.conv = v; }, 'add-conv') : null
+        )
+      );
+    }
+    sheet.setRight(okButton(add, 'add-ok'));
+    const hasView = (d.scans || []).length || ctx.scans.length;
+    sheet.body.append(view, hasView ? note('Markierte Zeilen sind erfasst. Tippe auf eine Zeile, die fehlt.') : null, form);
+    renderForm();
+    buildView();
   }
 
   // ------------------------------------------------------------ Artikel bearbeiten
@@ -1006,7 +1164,7 @@
     await DB.put('receipts', x);
   }
   async function purgeReceipt(r) {
-    await dropPhotos(r.photoIds);
+    await dropPhotos((r.photoIds || []).concat((r.scans || []).map(x => x.id)));
     await DB.del('receipts', r.id);
     S.receipts = S.receipts.filter(x => x.id !== r.id);
   }
@@ -1393,7 +1551,7 @@
 
   async function makeBackup() {
     const media = [];
-    for (const r of S.receipts) for (const id of r.photoIds || []) {
+    for (const r of S.receipts) for (const id of (r.photoIds || []).concat((r.scans || []).map(x => x.id))) {
       const m = await DB.get('media', id);
       if (m) media.push({ id, type: m.type, data: btoa(new Uint8Array(m.buf).reduce((s, b) => s + String.fromCharCode(b), '')) });
     }
@@ -1453,7 +1611,7 @@
     pg.render = () => {
       const trashN = S.receipts.filter(r => r.deletedAt).length;
       const learnedN = Object.keys(S.learned).length;
-      pg.body.replaceChildren(
+      pg.body.replaceChildren(...[
         sectionLabel('Darstellung'),
         group(lineBtn('Thema', THEMES[S.settings.theme] ? THEMES[S.settings.theme].name : 'Hell', async e => {
           const a = await popMenu(e.currentTarget, Object.keys(THEMES).map(k => ({ label: THEMES[k].name, value: k, checked: S.settings.theme === k })), 'Thema');
@@ -1469,49 +1627,109 @@
         sectionLabel('Daten'),
         group(
           lineBtn('Gelernte Zuordnungen', learnedN ? String(learnedN) : null, openLearned, { 'data-act': 'learned' }),
+          lineBtn('Zuordnungen exportieren', null, exportLearned, { 'data-act': 'learned-export' }),
           lineBtn('Tabelle exportieren', null, () => exportCsv(null, false), { 'data-act': 'csv-all' }),
           lineBtn('Backup erstellen', null, makeBackup, { 'data-act': 'backup' }),
           lineBtn('Backup einspielen', null, restoreBackup, { 'data-act': 'restore' }),
           lineBtn('Papierkorb', trashN ? String(trashN) : null, openTrash, { 'data-act': 'trash' })
         ),
+        sectionLabel('Speicher'),
+        group(line('Speicher auf dem iPhone', h('span', { class: 'line-value', 'data-field': 'persist' }, storageInfo.persisted == null ? '…' : storageInfo.persisted ? 'Dauerhaft' : 'Nicht dauerhaft')),
+          storageInfo.usage != null ? line('Belegt', h('span', { class: 'line-value num' }, (storageInfo.usage / 1048576).toFixed(1).replace('.', ',') + ' MB')) : null),
+        storageInfo.persisted === false ? note('iOS kann die Daten löschen, wenn die App lange nicht benutzt wird oder der Speicher knapp ist. Regelmäßig ein Backup erstellen.') : null,
         sectionLabel('Info'),
         group(
           lineBtn('Changelog', null, openChangelog, { 'data-act': 'changelog' }),
           line('Version', h('span', { class: 'line-value' }, 'Alpha ' + VERSION))
         )
-      );
+      ].filter(Boolean));
     };
     pg.render();
   }
 
   function openLearned() {
     const sheet = openSheet({ title: 'Gelernte Zuordnungen' });
-    const box = h('div', { class: 'group' });
     const del = async key => {
       const rec = S.learned[key];
-      if (!rec || !(await confirmDelete('Zuordnung für „' + rec.name + '“ vergessen?', 'Vergessen'))) return;
+      if (!rec || !(await confirmDelete(rec.ignore ? '„' + rec.name + '“ wieder als Artikel erkennen?' : 'Zuordnung für „' + rec.name + '“ vergessen?', rec.ignore ? 'Ja' : 'Vergessen'))) return;
       delete S.learned[key];
       await DB.del('learned', key);
       sheet.render();
     };
-    holdable(box, async (key, el) => {
-      const a = await popMenu(el, [{ label: 'Bearbeiten', value: 'edit', icon: 'pencil' }, { label: 'Vergessen', value: 'delete', icon: 'trash', danger: true }], (S.learned[key] || {}).name);
+    const onHold = async (key, el) => {
+      const rec = S.learned[key] || {};
+      const a = await popMenu(el, [rec.ignore ? null : { label: 'Bearbeiten', value: 'edit', icon: 'pencil' }, { label: rec.ignore ? 'Wieder erkennen' : 'Vergessen', value: 'delete', icon: rec.ignore ? 'undo' : 'trash', danger: !rec.ignore }], rec.name);
       if (a === 'edit') edit(key); else if (a === 'delete') del(key);
-    });
+    };
     const edit = key => {
       const rec = S.learned[key];
       if (rec.ignore) { del(key); return; }
       const it = { raw: key, name: rec.name, price: null, qty: 1, cat: rec.cat, diet: rec.diet, conv: rec.conv, health: rec.health };
       openItem(it, { onSave: async next => { Object.assign(it, next); const n = await learn(it); sheet.render(); refreshAll(); toast(n ? n + ' Artikel angepasst' : 'Gespeichert'); }, onDelete: () => { delete S.learned[key]; DB.del('learned', key); sheet.render(); } });
     };
+    sheet.setRight(h('button', { class: 'icon-btn', 'aria-label': 'Exportieren oder importieren', 'data-act': 'learned-io', onclick: async e => {
+      const a = await popMenu(e.currentTarget, [
+        { label: 'Exportieren', value: 'export', icon: 'share' },
+        { label: 'Importieren', value: 'import', icon: 'undo' }
+      ], 'Zuordnungen');
+      if (a === 'export') exportLearned();
+      else if (a === 'import') { await importLearned(); sheet.render(); }
+    } }, icon('share')));
     sheet.render = () => {
-      const list = Object.values(S.learned).sort((a, b) => (a.name || '').localeCompare(b.name || '', 'de'));
-      if (!list.length) { sheet.body.replaceChildren(h('div', { class: 'empty' }, 'Noch nichts gelernt.')); return; }
-      box.replaceChildren(...list.map(r => h('button', { class: 'line', 'data-drag': r.key, onclick: () => edit(r.key) },
-        h('span', { class: 'line-label two' }, h('b', null, r.name), h('small', null, r.ignore ? 'Kein Artikel, wird übersprungen' : [catOf(r.cat).name, catOf(r.cat).food !== false && r.diet ? dietName(r.diet) : null, r.conv ? 'Convenience' : null].filter(Boolean).join(' · '))), icon('chev'))));
-      sheet.body.replaceChildren(box);
+      const all = Object.values(S.learned);
+      if (!all.length) { sheet.body.replaceChildren(h('div', { class: 'empty' }, 'Noch nichts gelernt.')); return; }
+      const byName = (a, b) => (a.name || '').localeCompare(b.name || '', 'de');
+      const row = r => h('button', { class: 'line', 'data-drag': r.key, onclick: () => edit(r.key) },
+        h('span', { class: 'line-label two' }, h('b', null, r.name || r.key), h('small', null, r.ignore ? 'Wird übersprungen' : [catOf(r.cat).food !== false && r.diet ? dietName(r.diet) : null, r.conv ? 'Convenience' : null, r.health && catOf(r.cat).food !== false ? healthName(r.health) : null].filter(Boolean).join(' · ') || catOf(r.cat).name)), icon('chev'));
+      const kids = [];
+      // nach Kategorien gruppiert, in der Reihenfolge der Kategorien; „Kein Artikel“ am Ende
+      for (const c of D.CATS) {
+        const list = all.filter(r => !r.ignore && (r.cat || 'unbekannt') === c.k).sort(byName);
+        if (!list.length) continue;
+        kids.push(h('div', { class: 'section-label month-label' }, h('span', null, c.name), h('span', { class: 'num' }, String(list.length))));
+        const g = h('div', { class: 'group' }, list.map(row));
+        holdable(g, onHold);
+        kids.push(g);
+      }
+      const ign = all.filter(r => r.ignore).sort(byName);
+      if (ign.length) {
+        kids.push(h('div', { class: 'section-label month-label' }, h('span', null, 'Kein Artikel'), h('span', { class: 'num' }, String(ign.length))));
+        const g = h('div', { class: 'group' }, ign.map(row));
+        holdable(g, onHold);
+        kids.push(g);
+        kids.push(note('Diese Zeilen werden beim Scannen übersprungen. Antippen, um das rückgängig zu machen.'));
+      }
+      sheet.body.replaceChildren(...kids);
     };
     sheet.render();
+  }
+
+  function exportLearned() {
+    const list = Object.values(S.learned);
+    if (!list.length) { toast('Noch nichts gelernt'); return; }
+    const data = { app: 'bon_scan', type: 'zuordnungen', version: 1, created: Date.now(), learned: list };
+    offerFile('Zuordnungen bereit', new File([JSON.stringify(data, null, 1)], 'bon_scan_zuordnungen_' + toDateInput(Date.now()) + '.json', { type: 'application/json' }));
+  }
+  // Import führt zusammen: bei gleichem Eintrag gewinnt der neuere
+  async function importLearned() {
+    const f = await pickFile('application/json,.json', false);
+    if (!f) return;
+    let list;
+    try {
+      const data = JSON.parse(await f.text());
+      if (data.app !== 'bon_scan') throw new Error();
+      list = data.learned || [];
+    } catch (e) { toast('Keine gültige Datei'); return; }
+    let n = 0;
+    for (const l of list) {
+      if (!l || !l.key) continue;
+      const cur = S.learned[l.key];
+      if (cur && (cur.at || 0) >= (l.at || 0)) continue;
+      S.learned[l.key] = l; n++;
+      try { await DB.put('learned', l); } catch (e) {}
+    }
+    refreshAll();
+    toast(n ? n + ' Zuordnungen übernommen' : 'Nichts Neues');
   }
 
   function openChangelog() {
@@ -1527,6 +1745,16 @@
     sheet.render();
   }
 
+  // dauerhaften Speicher anfordern: Daten werden dann nicht automatisch von iOS geräumt
+  const storageInfo = { persisted: null, usage: null };
+  async function checkStorage() {
+    try {
+      if (navigator.storage && navigator.storage.persist) storageInfo.persisted = await navigator.storage.persisted() || await navigator.storage.persist();
+      if (navigator.storage && navigator.storage.estimate) storageInfo.usage = (await navigator.storage.estimate()).usage;
+    } catch (e) {}
+    if (page && page.name === 'settings' && page.render) page.render();
+  }
+
   // ------------------------------------------------------------ Start
   async function init() {
     loadSettings();
@@ -1540,7 +1768,7 @@
     // Papierkorb: was länger als 30 Tage liegt, endgültig entfernen
     for (const r of S.receipts.filter(x => x.deletedAt && Date.now() - x.deletedAt > TRASH_DAYS * DAY)) { try { await purgeReceipt(r); } catch (e) {} }
     refreshAll();
-    if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+    await checkStorage();
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
     // Texterkennung im Hintergrund vorbereiten, damit der erste Scan schnell geht
     setTimeout(() => OCR.warmup(), 1200);

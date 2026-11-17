@@ -2,6 +2,22 @@
 /* Änderungen je Version, neueste oben. Bei jedem Update ergänzen. */
 window.CHANGELOG = [
   {
+    v: '0.3', date: '2026-11-17',
+    title: 'Fehlende Artikel direkt auf dem Bon antippen, Rückgängig und Zuordnungen exportieren.',
+    added: [
+      'Artikel hinzufügen zeigt den bearbeiteten Bon: erfasste Zeilen sind grün markiert, eine fehlende Zeile antippen übernimmt Name und Preis',
+      'Anzeige, wie viel bis zur Summe laut Bon noch fehlt',
+      '„Kein Artikel“ und Entfernen lassen sich rückgängig machen',
+      'Gelernte Zuordnungen exportieren und importieren',
+      'Speicherstatus in den Einstellungen (dauerhaft oder nicht, belegter Platz)'
+    ],
+    changed: [
+      'Gelernte Zuordnungen sind nach Kategorien sortiert, „Kein Artikel“ steht gesammelt am Ende und lässt sich wieder aufheben',
+      'Das bearbeitete Bild jedes Scans wird mit dem Bon gespeichert und ist im Backup enthalten'
+    ],
+    removed: []
+  },
+  {
     v: '0.2', date: '2026-11-17',
     title: 'Deutlich zuverlässigere Erkennung, und wo die App unsicher ist, fragt sie nach.',
     added: [
