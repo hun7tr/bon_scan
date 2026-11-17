@@ -2,7 +2,7 @@
 (function () {
 
   // ------------------------------------------------------------ Konstanten
-  const VERSION = '0.1';
+  const VERSION = '0.2';
   const THEMES = { hell: { bar: '#F0EEE9', name: 'Hell' }, dunkel: { bar: '#161617', name: 'Dunkel' } };
   const D = window.BON_DATA, P = window.BonParser, OCR = window.BonOCR;
   const TRASH_DAYS = 30, DAY = 864e5, HOLD_MS = 1000;
@@ -573,6 +573,29 @@
     openReceipt(d, ctx);
   }
 
+  // Aus beiden Durchgängen der Texterkennung das Ergebnis wählen, das am besten zum Bon passt.
+  // Haben beide dieselben Artikel (gleiche Preise in gleicher Reihenfolge), gewinnt je Artikel die sicherer gelesene Zeile.
+  function bestParse(results) {
+    const scored = results.map(res => {
+      const parsed = P.parse(res.text, { lines: res.lines, learned: S.learned });
+      const checks = parsed.items.filter(i => i.check && i.check.includes('lesen')).length;
+      const fits = parsed.totalFound && Math.abs(parsed.sum - parsed.total) < 0.01;
+      parsed.items.forEach(i => { i._img = res.image; });
+      return { res, parsed, score: (fits ? 1000 : 0) + (parsed.totalFound ? 200 : 0) + parsed.items.length * 10 - checks * 4 + res.confidence / 10 };
+    }).sort((a, b) => b.score - a.score);
+    const best = scored[0];
+    if (scored[1]) {
+      const A = best.parsed.items, B = scored[1].parsed.items;
+      if (A.length === B.length && A.every((x, i) => x.price === B[i].price)) {
+        A.forEach((x, i) => {
+          const y = B[i], bad = z => (z.check || []).length * 100 - (z.conf || 0);
+          if (bad(y) < bad(x)) A[i] = y;
+        });
+      }
+    }
+    return best;
+  }
+
   // Texterkennung für ein Bild; Ergebnis wird an den Entwurf angehängt (für lange Bons in Abschnitten)
   async function readInto(d, ctx, canvas, sheet) {
     ctx.reading = true; ctx.error = null; ctx.progress = 0;
@@ -581,16 +604,21 @@
     const off = OCR.onState(st => { if (ctx.phase === 'prep') { ctx.progress = st.progress || 0; sheet.render(); } });
     try {
       if (S.settings.keepPhotos) { const b = await OCR.thumbBlob(canvas, 1000); if (b) ctx.photos.push(b); }
-      const res = await OCR.recognize(canvas, p => { ctx.phase = 'read'; ctx.progress = p; sheet.render(); });
-      const parsed = P.parse(res.text, { learned: S.learned });
+      const results = await OCR.recognize(canvas, p => { ctx.phase = 'read'; ctx.progress = p; sheet.render(); });
+      const { parsed, res } = bestParse(results);
       d.text = (d.text ? d.text + '\n\n' : '') + res.text.trim();
       if (!d.store && parsed.store) d.store = parsed.store;
       if (parsed.date && (!d.date || ctx.firstScan !== false)) d.date = parsed.date;
       if (parsed.totalFound) d.total = parsed.total;
-      parsed.items.forEach(it => { it.id = uid(); d.items.push(it); });
-      if (d.total == null && d.items.length) d.total = itemSum(d.items);
+      parsed.items.forEach(it => {
+        it.id = uid();
+        // Zeilenausschnitt nur für Artikel, bei denen der Nutzer nachsehen soll
+        if (it.check && it.check.includes('lesen') || it.check && it.check.includes('preis')) it.crop = OCR.lineCrop(it._img || res.image, it.bbox);
+        ['bbox', 'line', 'minWord', 'conf', 'unreadable', '_img'].forEach(k => delete it[k]);
+        d.items.push(it);
+      });
       ctx.firstScan = false;
-      if (!parsed.items.length) toast('Keine Artikel erkannt');
+      if (!d.items.length) toast('Keine Artikel erkannt');
       else haptic();
     } catch (e) {
       ctx.error = OCR.state.status === 'error'
@@ -621,7 +649,7 @@
 
     async function save() {
       if (ctx.reading) return;
-      d.total = d.total == null ? itemSum(d.items) : d.total;
+      d.open = openChecks(d).length + (d.total == null && d.items.length ? 1 : 0);
       for (const b of ctx.photos || []) { try { d.photoIds.push(await putPhoto(b)); } catch (e) {} }
       ctx.photos = [];
       d.updatedAt = Date.now();
@@ -637,8 +665,9 @@
     const editItem = (it, anchor) => openItem(it, {
       onSave: async (next, classChanged) => {
         Object.assign(it, next);
+        delete it.check; delete it.guessed;
         let n = 0;
-        if (classChanged) {
+        if (classChanged || it.cat !== 'unbekannt') {
           n = await learn(it, d.id);
           const key = keyOf(it);
           d.items.forEach(x => { if (x !== it && keyOf(x) === key) { Object.assign(x, { cat: it.cat, diet: it.diet, conv: it.conv, health: it.health, name: it.name, src: 'learned' }); n++; } });
@@ -698,10 +727,23 @@
 
       const sum = itemSum(d.items);
       const diff = d.total == null ? 0 : round2(sum - d.total);
+      const open = openChecks(d);
+      if (open.length || (d.items.length && d.total == null)) {
+        const parts = [];
+        const n = k => open.filter(it => it.check.includes(k)).length;
+        if (n('lesen')) parts.push(n('lesen') + ' unsicher gelesen');
+        if (n('preis')) parts.push(n('preis') + ' Preis prüfen');
+        if (n('zuordnen')) parts.push(n('zuordnen') + ' nicht zugeordnet');
+        if (d.total == null) parts.push('Summe nicht erkannt');
+        kids.push(h('div', { class: 'help-card' },
+          h('div', { class: 'help-title' }, open.length ? (open.length === 1 ? '1 Artikel braucht deine Hilfe' : open.length + ' Artikel brauchen deine Hilfe') : 'Die Summe braucht deine Hilfe'),
+          h('div', { class: 'help-sub' }, parts.join(' · ')),
+          h('button', { class: 'btn primary', 'data-act': 'check', onclick: () => openCheck(d, sheet) }, 'Jetzt prüfen')));
+      }
       kids.push(group(
         lineBtn('Markt', d.store || 'Wählen', pickStore, { 'data-act': 'store' }),
         line('Datum', h('input', { type: 'date', 'data-field': 'date', value: toDateInput(d.date), onchange: e => { d.date = fromDateInput(e.target.value, d.date); } })),
-        line('Summe laut Bon', h('span', { class: 'euro-field' }, euroInput(d.total, n => { d.total = n; sheet.render(); }, 'total'), h('span', null, '€'))),
+        line('Summe laut Bon', h('span', { class: 'euro-field' + (d.total == null && d.items.length ? ' missing' : '') }, euroInput(d.total, n => { d.total = n; sheet.render(); }, 'total'), h('span', null, '€'))),
         line('Summe der Artikel', h('span', { class: 'line-value num' + (Math.abs(diff) >= 0.01 ? ' warn' : '') }, fmtEur(sum)))
       ));
       if (d.items.length && Math.abs(diff) >= 0.01) kids.push(note('Differenz ' + fmtEur(Math.abs(diff)) + (diff > 0 ? ' zu viel' : ' zu wenig') + '. Fehlt ein Artikel oder ist ein Preis falsch gelesen?'));
@@ -736,8 +778,11 @@
     return sheet;
   }
 
+  const CHECK_TEXT = { lesen: 'Unsicher gelesen', preis: 'Preis prüfen', zuordnen: 'Nicht zugeordnet' };
+  const openChecks = d => d.items.filter(it => it.check && it.check.length);
   function itemMeta(it) {
     const parts = [];
+    if (it.check && it.check.length) return it.check.map(k => CHECK_TEXT[k]).join(' · ');
     if (it.kg) parts.push(String(it.kg).replace('.', ',') + ' kg × ' + fmtEur(it.perKg) + '/kg');
     else if (it.qty > 1) parts.push(it.qty + ' × ' + fmtEur(it.unit != null ? it.unit : it.price / it.qty));
     const c = catOf(it.cat);
@@ -751,14 +796,128 @@
     return parts.join(' · ');
   }
   function itemRow(it, onTap, extra) {
-    return h('button', { class: 'line item-row' + (it.cat === 'unbekannt' ? ' unknown' : ''), 'data-drag': it.id, onclick: onTap },
-      h('span', { class: 'diet-dot', style: 'background:' + dietColor(it) }),
+    const open = it.check && it.check.length;
+    return h('button', { class: 'line item-row' + (open ? ' needs-check' : it.cat === 'unbekannt' ? ' unknown' : ''), 'data-drag': it.id, onclick: onTap },
+      open ? h('span', { class: 'check-mark', 'aria-label': 'Prüfen' }, '?') : h('span', { class: 'diet-dot', style: 'background:' + dietColor(it) }),
       h('span', { class: 'line-label two' }, h('b', null, it.name || 'Ohne Namen'), h('small', null, extra || itemMeta(it))),
-      h('span', { class: 'line-value num' }, fmtEur(it.price)));
+      h('span', { class: 'line-value num' }, it.price == null ? '–' : fmtEur(it.price)));
   }
   function dietColor(it) {
     if (!isFood(it)) return 'transparent';
     return (D.DIETS.find(x => x.k === (it.diet || null)) || D.DIETS[D.DIETS.length - 1]).color;
+  }
+
+  // ------------------------------------------------------------ Prüfen: Schritt für Schritt durch alles, was unsicher ist
+  async function learnIgnore(it) {
+    const key = keyOf(it);
+    if (!key || key.length < 3) return;
+    const rec = { key, ignore: true, name: it.name || it.raw, at: Date.now() };
+    S.learned[key] = rec;
+    try { await DB.put('learned', rec); } catch (e) {}
+  }
+
+  function openCheck(d, parent) {
+    const steps = openChecks(d).map(it => ({ it, dr: { name: it.name || '', price: it.price, cat: it.cat, diet: it.diet || null, conv: !!it.conv, health: it.health || null, catTouched: it.cat !== 'unbekannt' } }));
+    if (d.total == null && d.items.length) steps.push({ total: true, dr: { total: null } });
+    if (!steps.length) return;
+    let k = 0;
+    const sheet = openSheet({ title: 'Prüfen', onClosed: () => parent.render() });
+    const finish = () => {
+      sheet.close();
+      const left = openChecks(d).length + (d.total == null ? 1 : 0);
+      toast(left ? left + ' Punkte noch offen' : 'Alles geprüft');
+    };
+    async function apply(st) {
+      const it = st.it, dr = st.dr;
+      if (st.total) { if (dr.total != null) d.total = dr.total; return; }
+      if (!dr.name.trim()) return;
+      Object.assign(it, { name: dr.name.trim(), price: dr.price, cat: dr.cat, diet: dr.diet, conv: dr.conv, health: dr.health, src: 'user' });
+      if (it.qty > 1 && it.price != null) it.unit = round2(it.price / it.qty);
+      delete it.check; delete it.guessed; delete it.fixed;
+      // Gemerkt wird unter dem gelesenen Text: liest die Erkennung dieselbe Zeile wieder so, kommt der richtige Name heraus
+      if (it.cat !== 'unbekannt') {
+        await learn(it, d.id);
+        applyLearnedTo(d.items.filter(x => x !== it), keyOf(it));
+      }
+    }
+    const next = async skip => {
+      const st = steps[k];
+      if (!skip) {
+        if (st.it && !st.dr.name.trim()) { toast('Name fehlt'); return; }
+        if (st.it && st.dr.price == null) { toast('Preis fehlt'); return; }
+        await apply(st);
+      }
+      haptic();
+      if (k < steps.length - 1) { k++; sheet.render(); } else finish();
+    };
+    const pick = async (e, st, key, list, title) => {
+      const a = await popMenu(e.currentTarget, list.map(x => ({ label: x.name, value: x.k == null ? '__null' : x.k, checked: (st.dr[key] || null) === (x.k || null) })), title);
+      if (a === undefined) return;
+      const v = a === '__null' ? null : a;
+      if (key === 'cat') {
+        const c = catOf(v);
+        st.dr.cat = v; st.dr.catTouched = true;
+        if (c.food === false) { st.dr.diet = null; st.dr.health = null; st.dr.conv = false; }
+        else { if (c.d !== undefined) st.dr.diet = c.d; if (c.h !== undefined) st.dr.health = c.h; st.dr.conv = !!c.v; }
+      } else st.dr[key] = v;
+      sheet.render();
+    };
+    sheet.render = () => {
+      const st = steps[k];
+      sheet.setTitle('Prüfen ' + (k + 1) + ' von ' + steps.length);
+      const kids = [h('div', { class: 'progress' }, steps.map((_, i) => h('i', { class: i < k ? 'done' : i === k ? 'on' : null })))];
+      if (st.total) {
+        kids.push(h('div', { class: 'step-title' }, 'Wie hoch ist die Summe?'));
+        kids.push(group(line('Summe laut Bon', h('span', { class: 'euro-field' }, euroInput(st.dr.total, n => { st.dr.total = n; }, 'check-total'), h('span', null, '€')))));
+        kids.push(note('Summe der erkannten Artikel: ' + fmtEur(itemSum(d.items))));
+      } else {
+        const it = st.it, dr = st.dr, c = it.check || [];
+        const title = c.includes('lesen') ? 'Was steht hier?' : c.includes('preis') ? 'Stimmt der Preis?' : 'Was ist das?';
+        kids.push(h('div', { class: 'step-title' }, title));
+        if (it.crop) kids.push(h('img', { class: 'line-crop', src: it.crop, alt: 'Ausschnitt vom Bon' }));
+        else if (it.raw) kids.push(h('div', { class: 'raw-text' }, it.raw));
+        const why = [];
+        if (it.guessed) why.push('Name geraten');
+        if (c.includes('lesen') && !it.guessed) why.push('Schrift unsicher gelesen');
+        if (it.fixed) why.push('Preis an die Summe angeglichen');
+        if (it.price == null) why.push('Preis nicht gelesen');
+        if (c.includes('zuordnen')) why.push('Produkt unbekannt');
+        kids.push(note(why.join(' · ')));
+        const food = catOf(dr.cat).food !== false;
+        kids.push(group(
+          line('Name', h('input', { type: 'text', 'data-field': 'check-name', value: dr.name, placeholder: 'Wie heißt das Produkt?', autocomplete: 'off', autocapitalize: 'sentences', enterkeyhint: 'next',
+            oninput: e => { dr.name = e.target.value; },
+            onchange: e => {
+              // Kategorie vorschlagen, solange der Nutzer keine gewählt hat
+              if (dr.catTouched) return;
+              const g = P.categorize(e.target.value, S.learned);
+              if (!g.ignore && g.cat !== 'unbekannt') { Object.assign(dr, { cat: g.cat, diet: g.diet, conv: g.conv, health: g.health }); sheet.render(); }
+            } })),
+          line('Preis', h('span', { class: 'euro-field' }, euroInput(dr.price, n => { dr.price = n; }, 'check-price'), h('span', null, '€')))
+        ));
+        kids.push(group(
+          lineBtn('Kategorie', dr.cat === 'unbekannt' ? 'Wählen' : catOf(dr.cat).name, e => pick(e, st, 'cat', D.CATS.filter(x => x.k !== 'unbekannt'), 'Kategorie'), { 'data-act': 'check-cat' }),
+          food && dr.cat !== 'unbekannt' ? lineBtn('Ernährung', dietName(dr.diet), e => pick(e, st, 'diet', D.DIETS, 'Ernährung'), { 'data-act': 'check-diet' }) : null,
+          food && dr.cat !== 'unbekannt' ? lineSwitch('Convenience', dr.conv, v => { dr.conv = v; }, 'check-conv') : null
+        ));
+        kids.push(group(h('button', { class: 'line danger', 'data-act': 'not-item', onclick: async () => {
+          d.items = d.items.filter(x => x !== it);
+          await learnIgnore(it);
+          toast('Entfernt · wird künftig übersprungen');
+          steps.splice(k, 1);
+          if (!steps.length) { finish(); return; }
+          if (k >= steps.length) k = steps.length - 1;
+          sheet.render();
+        } }, 'Kein Artikel')));
+      }
+      sheet.body.replaceChildren(...kids);
+      sheet.foot.className = 'sheet-foot three';
+      sheet.foot.replaceChildren(
+        h('button', { class: 'btn ghost', 'data-act': 'check-back', style: k ? null : 'visibility:hidden', onclick: () => { if (k) { k--; sheet.render(); } } }, 'Zurück'),
+        h('button', { class: 'btn ghost', 'data-act': 'check-skip', onclick: () => next(true) }, 'Überspringen'),
+        h('button', { class: 'btn primary', 'data-act': 'check-next', onclick: () => next(false) }, k < steps.length - 1 ? 'Weiter' : 'Fertig'));
+    };
+    sheet.render();
   }
 
   // ------------------------------------------------------------ Artikel bearbeiten
@@ -799,6 +958,7 @@
       sheet.setRight(okButton(save, 'item-ok'));
       const food = catOf(d.cat).food !== false;
       const kids = [
+        it.crop ? h('img', { class: 'line-crop', src: it.crop, alt: 'Ausschnitt vom Bon' }) : null,
         group(
           line('Name', h('input', { type: 'text', 'data-field': 'name', value: d.name, placeholder: 'Name', autocomplete: 'off', autocapitalize: 'sentences', enterkeyhint: 'done', oninput: e => { d.name = e.target.value; } })),
           line('Preis', h('span', { class: 'euro-field' }, euroInput(d.price, n => { d.price = n; }, 'price'), h('span', null, '€'))),
@@ -915,7 +1075,7 @@
           const unk = r.items.filter(i => i.cat === 'unbekannt').length;
           return h('button', { class: 'line', 'data-drag': r.id, onclick: () => openReceipt(r) },
             h('span', { class: 'line-label two' }, h('b', null, r.store || 'Bon'),
-              h('small', null, fmtDate(rDate(r)) + ' · ' + r.items.length + ' Artikel' + (unk ? ' · ' + unk + ' nicht zugeordnet' : ''))),
+              h('small', null, fmtDate(rDate(r)) + ' · ' + r.items.length + ' Artikel', r.open ? h('span', { class: 'open-count' }, ' · ' + r.open + ' offen') : (unk ? ' · ' + unk + ' nicht zugeordnet' : ''))),
             h('span', { class: 'line-value num big' }, fmtEur(r.total)));
         })));
       });
@@ -1125,6 +1285,8 @@
     const edit = ({ it, r }) => openItem(it, {
       onSave: async (next, classChanged) => {
         Object.assign(it, next);
+        delete it.check; delete it.guessed;
+        r.open = openChecks(r).length + (r.total == null && r.items.length ? 1 : 0);
         await DB.put('receipts', r);
         let n = 0;
         if (classChanged) n = await learn(it);
@@ -1338,6 +1500,7 @@
     });
     const edit = key => {
       const rec = S.learned[key];
+      if (rec.ignore) { del(key); return; }
       const it = { raw: key, name: rec.name, price: null, qty: 1, cat: rec.cat, diet: rec.diet, conv: rec.conv, health: rec.health };
       openItem(it, { onSave: async next => { Object.assign(it, next); const n = await learn(it); sheet.render(); refreshAll(); toast(n ? n + ' Artikel angepasst' : 'Gespeichert'); }, onDelete: () => { delete S.learned[key]; DB.del('learned', key); sheet.render(); } });
     };
@@ -1345,7 +1508,7 @@
       const list = Object.values(S.learned).sort((a, b) => (a.name || '').localeCompare(b.name || '', 'de'));
       if (!list.length) { sheet.body.replaceChildren(h('div', { class: 'empty' }, 'Noch nichts gelernt.')); return; }
       box.replaceChildren(...list.map(r => h('button', { class: 'line', 'data-drag': r.key, onclick: () => edit(r.key) },
-        h('span', { class: 'line-label two' }, h('b', null, r.name), h('small', null, [catOf(r.cat).name, catOf(r.cat).food !== false && r.diet ? dietName(r.diet) : null, r.conv ? 'Convenience' : null].filter(Boolean).join(' · '))), icon('chev'))));
+        h('span', { class: 'line-label two' }, h('b', null, r.name), h('small', null, r.ignore ? 'Kein Artikel, wird übersprungen' : [catOf(r.cat).name, catOf(r.cat).food !== false && r.diet ? dietName(r.diet) : null, r.conv ? 'Convenience' : null].filter(Boolean).join(' · '))), icon('chev'))));
       sheet.body.replaceChildren(box);
     };
     sheet.render();

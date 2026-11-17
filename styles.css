@@ -657,3 +657,16 @@ button.line:active, .line-main:active { background: rgba(128, 128, 128, .14); }
 .line-label + .ico svg { margin-left: auto; }
 .line.legend .line-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .line.legend .line-value { flex: none; }
+
+/* ---------- Prüfen ---------- */
+.help-card { margin: 0 0 18px; padding: 16px; border-radius: 22px; background: var(--card); box-shadow: inset 0 0 0 2px var(--accent); }
+.help-title { font: 700 19px/1.25 var(--f-text); }
+.help-sub { margin: 4px 0 14px; font-size: 13px; color: var(--muted); }
+.check-mark { flex: none; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; background: var(--accent); color: var(--on-accent); font: 700 14px/1 var(--f-text); margin-left: -6px; }
+.item-row.needs-check small { color: var(--accent); }
+.line-crop { display: block; width: 100%; margin: 0 0 10px; border-radius: 14px; background: #fff; box-shadow: inset 0 0 0 1px var(--line); padding: 6px 4px; image-rendering: auto; }
+[data-theme="dunkel"] .line-crop { filter: none; }
+.raw-text { margin: 0 0 10px; padding: 14px 16px; border-radius: 14px; background: var(--card); font: 15px/1.4 ui-monospace, "SF Mono", Menlo, monospace; overflow-wrap: anywhere; }
+.euro-field.missing input::placeholder { color: var(--red); }
+.open-count { color: var(--accent); font-weight: 600; }
+.sheet-foot.three .btn { min-height: 50px; }

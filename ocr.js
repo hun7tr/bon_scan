@@ -61,7 +61,7 @@
         errorHandler: e => console.warn('ocr', e)
       });
       // Bons sind eine einzige Textspalte: Zeilen mit Name links und Preis rechts zusammenhalten (PSM 6)
-      await w.setParameters({ tessedit_pageseg_mode: '6', preserve_interword_spaces: '1', user_defined_dpi: '300' });
+      await w.setParameters({ tessedit_pageseg_mode: '6', preserve_interword_spaces: '1', user_defined_dpi: '300', tessedit_char_blacklist: '|{}[]<>@©®“”„‘’»«~^_\\' });
       worker = w;
       set({ status: 'ready', progress: 1, source: local ? 'lokal' : 'cdn' });
       return w;
@@ -97,83 +97,315 @@
     return thr;
   }
 
-  // Papier (hell) vom Hintergrund trennen: Spalten und Zeilen mit überwiegend hellen Pixeln bilden den Bon
+  // Papier vom Hintergrund trennen. Spalten: überwiegend hell. Zeilen: innerhalb dieser Spalten überwiegend hell.
   function findPaper(src) {
-    const sw = 160, sh = Math.max(40, Math.round(src.height * sw / src.width));
+    const sw = 200, sh = Math.max(40, Math.round(src.height * sw / src.width));
     const c = canvasOf(sw, sh), x = c.getContext('2d', { willReadFrequently: true });
     x.filter = 'blur(2px)';
     x.drawImage(src, 0, 0, sw, sh);
     const g = toGray(x, sw, sh), t = otsu(g);
-    const colFrac = new Array(sw).fill(0), rowFrac = new Array(sh).fill(0);
-    for (let y = 0; y < sh; y++) for (let xx = 0; xx < sw; xx++) if (g[y * sw + xx] > t) { colFrac[xx]++; rowFrac[y]++; }
-    const span = (arr, n, lim) => {
+    const bright = i => g[i] > t;
+    const span = (arr, lim) => {
       const mid = Math.floor(arr.length / 2);
       let a = mid, b = mid;
-      if (arr[mid] / n < lim) {
-        let best = -1; arr.forEach((v, i) => { if (v / n >= lim && (best < 0 || Math.abs(i - mid) < Math.abs(best - mid))) best = i; });
+      if (arr[mid] < lim) {
+        let best = -1; arr.forEach((v, i) => { if (v >= lim && (best < 0 || Math.abs(i - mid) < Math.abs(best - mid))) best = i; });
         if (best < 0) return null;
         a = b = best;
       }
-      while (a > 0 && arr[a - 1] / n >= lim) a--;
-      while (b < arr.length - 1 && arr[b + 1] / n >= lim) b++;
+      // kleine Lücken (Knicke, dunkle Zeilen) überbrücken
+      const ok = i => arr[i] >= lim || (arr[i - 1] >= lim && arr[i + 1] >= lim);
+      while (a > 0 && ok(a - 1)) a--;
+      while (b < arr.length - 1 && ok(b + 1)) b++;
       return [a, b];
     };
-    const cs = span(colFrac, sh, .45), rs = span(rowFrac, sw, .25);
-    if (!cs || !rs) return null;
+    const col = new Array(sw).fill(0);
+    for (let y = 0; y < sh; y++) for (let xx = 0; xx < sw; xx++) if (bright(y * sw + xx)) col[xx]++;
+    const cs = span(col.map(v => v / sh), .4);
+    if (!cs) return null;
+    const row = new Array(sh).fill(0), cw = cs[1] - cs[0] + 1;
+    for (let y = 0; y < sh; y++) for (let xx = cs[0]; xx <= cs[1]; xx++) if (bright(y * sw + xx)) row[y]++;
+    const rs = span(row.map(v => v / cw), .6);
+    if (!rs) return null;
     const fx = src.width / sw, fy = src.height / sh;
-    const box = { x: cs[0] * fx, y: rs[0] * fy, w: (cs[1] - cs[0] + 1) * fx, h: (rs[1] - rs[0] + 1) * fy };
-    // zu klein oder fast das ganze Bild: nicht zuschneiden
-    if (box.w * box.h < src.width * src.height * .12) return null;
-    const m = Math.round(Math.min(box.w, box.h) * .02);
+    const box = { x: cs[0] * fx, y: rs[0] * fy, w: cw * fx, h: (rs[1] - rs[0] + 1) * fy };
+    if (box.w * box.h < src.width * src.height * .08) return null;
+    const m = Math.round(box.w * .03);
     box.x = Math.max(0, box.x - m); box.y = Math.max(0, box.y - m);
     box.w = Math.min(src.width - box.x, box.w + 2 * m); box.h = Math.min(src.height - box.y, box.h + 2 * m);
     return box;
   }
 
-  // Ergebnis: Schwarz-Weiß-Bild, Bonbreite etwa 1400 px, ungleichmäßiges Licht ausgeglichen (Bradley-Schwelle)
+  // Schräglage schätzen: bei richtigem Winkel bilden die Textzeilen scharfe Spitzen im Zeilenprofil
+  function estimateSkew(src, bx) {
+    const sw = 420, sh = Math.max(40, Math.round(bx.h * sw / bx.w));
+    const c = canvasOf(sw, sh), x = c.getContext('2d', { willReadFrequently: true });
+    x.drawImage(src, bx.x, bx.y, bx.w, bx.h, 0, 0, sw, sh);
+    const g = toGray(x, sw, sh), t = otsu(g) * .85;
+    const pts = [];
+    for (let y = 0; y < sh; y++) for (let xx = 0; xx < sw; xx++) if (g[y * sw + xx] < t) pts.push(xx - sw / 2, y);
+    if (pts.length < 200) return 0;
+    let best = 0, bestScore = -1;
+    for (let a = -6; a <= 6.001; a += .25) {
+      const tan = Math.tan(a * Math.PI / 180), hist = new Float32Array(sh + 400);
+      for (let i = 0; i < pts.length; i += 2) { const yy = Math.round(pts[i + 1] + pts[i] * tan) + 200; if (yy >= 0 && yy < hist.length) hist[yy]++; }
+      let score = 0;
+      for (let i = 1; i < hist.length; i++) { const d = hist[i] - hist[i - 1]; score += d * d; }
+      if (score > bestScore) { bestScore = score; best = a; }
+    }
+    return best;
+  }
+
+  // Beleuchtung schätzen: hellster Wert je Block (das Papier), geglättet und wieder auf volle Größe gebracht
+  function background(g, w, h) {
+    const B = 24, gw = Math.ceil(w / B), gh = Math.ceil(h / B);
+    let grid = new Float32Array(gw * gh);
+    for (let by = 0; by < gh; by++) for (let bxx = 0; bxx < gw; bxx++) {
+      // 95. Perzentil statt Maximum, damit einzelne Glanzpunkte nicht stören
+      const vals = [];
+      for (let y = by * B; y < Math.min(h, by * B + B); y += 2) for (let xx = bxx * B; xx < Math.min(w, bxx * B + B); xx += 2) vals.push(g[y * w + xx]);
+      vals.sort((p, q) => p - q);
+      grid[by * gw + bxx] = vals[Math.floor(vals.length * .95)] || 255;
+    }
+    // Blöcke ohne Papier (nur Schrift) mit dem hellsten Nachbarn füllen, dann glätten
+    for (let pass = 0; pass < 2; pass++) {
+      const n = new Float32Array(grid.length);
+      for (let y = 0; y < gh; y++) for (let xx = 0; xx < gw; xx++) {
+        let m = 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const yy = y + dy, xc = xx + dx; if (yy >= 0 && yy < gh && xc >= 0 && xc < gw) m = Math.max(m, grid[yy * gw + xc]); }
+        n[y * gw + xx] = m;
+      }
+      grid = n;
+    }
+    for (let pass = 0; pass < 3; pass++) {
+      const n = new Float32Array(grid.length);
+      for (let y = 0; y < gh; y++) for (let xx = 0; xx < gw; xx++) {
+        let s = 0, k = 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const yy = y + dy, xc = xx + dx; if (yy >= 0 && yy < gh && xc >= 0 && xc < gw) { s += grid[yy * gw + xc]; k++; } }
+        n[y * gw + xx] = s / k;
+      }
+      grid = n;
+    }
+    const bg = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const fy = Math.min(gh - 1.001, Math.max(0, y / B - .5)), y0 = Math.floor(fy), ty = fy - y0, y1 = Math.min(gh - 1, y0 + 1);
+      for (let xx = 0; xx < w; xx++) {
+        const fx = Math.min(gw - 1.001, Math.max(0, xx / B - .5)), x0 = Math.floor(fx), tx = fx - x0, x1 = Math.min(gw - 1, x0 + 1);
+        const a = grid[y0 * gw + x0] * (1 - tx) + grid[y0 * gw + x1] * tx, b = grid[y1 * gw + x0] * (1 - tx) + grid[y1 * gw + x1] * tx;
+        bg[y * w + xx] = a * (1 - ty) + b * ty;
+      }
+    }
+    return bg;
+  }
+
+  // Sauvola-Schwelle über Integralbilder: T = m · (1 + k · (s / 128 − 1))
+  function sauvola(g, w, h, win, k) {
+    const W = w + 1, I = new Float64Array(W * (h + 1)), Q = new Float64Array(W * (h + 1));
+    for (let y = 0; y < h; y++) {
+      let r = 0, rq = 0;
+      for (let xx = 0; xx < w; xx++) { const v = g[y * w + xx]; r += v; rq += v * v; I[(y + 1) * W + xx + 1] = I[y * W + xx + 1] + r; Q[(y + 1) * W + xx + 1] = Q[y * W + xx + 1] + rq; }
+    }
+    const out = new Uint8Array(w * h), s = win >> 1;
+    for (let y = 0; y < h; y++) {
+      const y1 = Math.max(0, y - s), y2 = Math.min(h - 1, y + s);
+      for (let xx = 0; xx < w; xx++) {
+        const x1 = Math.max(0, xx - s), x2 = Math.min(w - 1, xx + s), n = (x2 - x1 + 1) * (y2 - y1 + 1);
+        const a = (y2 + 1) * W + x2 + 1, b = y1 * W + x2 + 1, c = (y2 + 1) * W + x1, d = y1 * W + x1;
+        const m = (I[a] - I[b] - I[c] + I[d]) / n, v = Math.max(0, (Q[a] - Q[b] - Q[c] + Q[d]) / n - m * m);
+        out[y * w + xx] = g[y * w + xx] > m * (1 + k * (Math.sqrt(v) / 128 - 1)) ? 255 : 0;
+      }
+    }
+    return out;
+  }
+
+  // schwarze Flächen, die den Bildrand berühren (Tisch, Hand, Schatten am Rand), entfernen
+  function clearBorder(bin, w, h) {
+    const stack = new Int32Array(w * h);
+    let sp = 0;
+    const push = i => { if (bin[i] === 0) { bin[i] = 255; stack[sp++] = i; } };
+    for (let xx = 0; xx < w; xx++) { push(xx); push((h - 1) * w + xx); }
+    for (let y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
+    while (sp) {
+      const i = stack[--sp], xx = i % w;
+      if (xx > 0) push(i - 1);
+      if (xx < w - 1) push(i + 1);
+      if (i >= w) push(i - w);
+      if (i < w * (h - 1)) push(i + w);
+    }
+  }
+
+  // Textbereich finden: zusammenhängende schwarze Flächen, die wie Buchstaben aussehen (ähnliche Höhe, Nachbarn auf
+  // derselben Grundlinie), bilden Zeilen. Krümel vom Boden, Hand oder Tisch haben solche Nachbarn nicht.
+  function textRegion(bin, w, h) {
+    const lab = new Int32Array(w * h), stack = new Int32Array(w * h), comps = [];
+    for (let i0 = 0; i0 < bin.length; i0++) {
+      if (bin[i0] !== 0 || lab[i0]) continue;
+      const id = comps.length + 1;
+      let sp = 0, x0 = w, y0 = h, x1 = 0, y1 = 0, n = 0;
+      stack[sp++] = i0; lab[i0] = id;
+      while (sp) {
+        const i = stack[--sp], xx = i % w, y = (i - xx) / w;
+        n++;
+        if (xx < x0) x0 = xx; if (xx > x1) x1 = xx; if (y < y0) y0 = y; if (y > y1) y1 = y;
+        if (xx > 0 && bin[i - 1] === 0 && !lab[i - 1]) { lab[i - 1] = id; stack[sp++] = i - 1; }
+        if (xx < w - 1 && bin[i + 1] === 0 && !lab[i + 1]) { lab[i + 1] = id; stack[sp++] = i + 1; }
+        if (y > 0 && bin[i - w] === 0 && !lab[i - w]) { lab[i - w] = id; stack[sp++] = i - w; }
+        if (y < h - 1 && bin[i + w] === 0 && !lab[i + w]) { lab[i + w] = id; stack[sp++] = i + w; }
+      }
+      comps.push({ x0, y0, x1, y1, n, cw: x1 - x0 + 1, ch: y1 - y0 + 1 });
+    }
+    const cand = comps.filter(c => c.ch >= 10 && c.ch <= 140 && c.cw <= c.ch * 2.5 && c.n >= 25 && c.n <= c.cw * c.ch * .9);
+    if (cand.length < 20) return null;
+    // Raster zum schnellen Finden von Nachbarn
+    const G = 64, gw = Math.ceil(w / G), grid = new Map();
+    cand.forEach((c, i) => { const k = Math.floor(c.y0 / G) * gw + Math.floor(c.x0 / G); if (!grid.has(k)) grid.set(k, []); grid.get(k).push(i); });
+    const texty = cand.filter(c => {
+      const gx = Math.floor(c.x0 / G), gy = Math.floor(c.y0 / G);
+      let found = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -2; dx <= 2; dx++) for (const j of grid.get((gy + dy) * gw + gx + dx) || []) {
+        const d = cand[j];
+        if (d === c) continue;
+        const r = d.ch / c.ch, cy = Math.abs((d.y1) - (c.y1)), gap = Math.max(d.x0 - c.x1, c.x0 - d.x1);
+        if (r > .6 && r < 1.6 && cy < c.ch * .35 && gap < c.ch * 1.6) found++;
+      }
+      return found >= 2;
+    });
+    if (texty.length < 15) return null;
+    // Dichte je Zelle, größte zusammenhängende Gruppe von Zellen ist der Bon
+    const hs = texty.map(c => c.ch).sort((a, b) => a - b), h0 = hs[hs.length >> 1];
+    const C = Math.max(20, h0 * 3), cw2 = Math.ceil(w / C), chh = Math.ceil(h / C), dens = new Uint16Array(cw2 * chh);
+    texty.forEach(c => dens[Math.floor((c.y0 + c.y1) / 2 / C) * cw2 + Math.floor((c.x0 + c.x1) / 2 / C)]++);
+    const seen = new Uint8Array(dens.length);
+    let best = null;
+    for (let s0 = 0; s0 < dens.length; s0++) {
+      if (dens[s0] < 2 || seen[s0]) continue;
+      const q = [s0]; seen[s0] = 1;
+      let cnt = 0, x0 = cw2, y0 = chh, x1 = 0, y1 = 0;
+      while (q.length) {
+        const i = q.pop(), cx = i % cw2, cy = (i - cx) / cw2;
+        cnt += dens[i];
+        x0 = Math.min(x0, cx); x1 = Math.max(x1, cx); y0 = Math.min(y0, cy); y1 = Math.max(y1, cy);
+        // Lücke von bis zu zwei Zellen überbrücken (Leerzeilen, eingerückte Zeilen)
+        for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+          const nx = cx + dx, ny = cy + dy;
+          if (nx < 0 || ny < 0 || nx >= cw2 || ny >= chh) continue;
+          const j = ny * cw2 + nx;
+          if (!seen[j] && dens[j] >= 2) { seen[j] = 1; q.push(j); }
+        }
+      }
+      if (!best || cnt > best.cnt) best = { cnt, x0, y0, x1, y1 };
+    }
+    if (!best) return null;
+    const m = Math.round(h0 * 1.2);
+    const r = { x: Math.max(0, best.x0 * C - m), y: Math.max(0, best.y0 * C - m) };
+    r.w = Math.min(w, (best.x1 + 1) * C + m) - r.x;
+    r.h = Math.min(h, (best.y1 + 1) * C + m) - r.y;
+    // Flächen außerhalb, die nicht wie Schrift aussehen, sind nun abgeschnitten; innerhalb große Kleckse entfernen
+    comps.forEach((c, i) => {
+      if (c.ch > h0 * 6 && c.cw > h0 * 6 && c.n > c.cw * c.ch * .5) {
+        for (let y = c.y0; y <= c.y1; y++) for (let xx = c.x0; xx <= c.x1; xx++) if (lab[y * w + xx] === i + 1) bin[y * w + xx] = 255;
+      }
+    });
+    return r;
+  }
+
+  // Aufbereitung für die Texterkennung:
+  // 1. Bon ausschneiden, 2. begradigen, 3. Graustufen, 4. Beleuchtung ausgleichen (durch geschätzten Hintergrund teilen),
+  // 5. Kontrast stark spreizen, 6. Sauvola-Schwelle (Schwarz-Weiß), 7. Ränder säubern.
+  // mode 'gray' liefert das kontrastverstärkte Graubild (Stufe 5) als zweiten Versuch.
   function prepare(src, opts) {
     opts = opts || {};
     const box = opts.noTrim ? null : findPaper(src);
     const bx = box || { x: 0, y: 0, w: src.width, h: src.height };
+    const angle = opts.noDeskew ? 0 : estimateSkew(src, bx);
     let scale = 1400 / bx.w;
-    scale = Math.max(.35, Math.min(2.2, scale));
+    scale = Math.max(.35, Math.min(2.5, scale));
     if (bx.h * scale > 9000) scale = 9000 / bx.h;
     const w = Math.round(bx.w * scale), h = Math.round(bx.h * scale);
     const c = canvasOf(w, h), x = c.getContext('2d', { willReadFrequently: true });
+    x.fillStyle = '#fff';
+    x.fillRect(0, 0, w, h);
     x.imageSmoothingQuality = 'high';
-    x.drawImage(src, bx.x, bx.y, bx.w, bx.h, 0, 0, w, h);
+    x.translate(w / 2, h / 2);
+    x.rotate(-angle * Math.PI / 180);
+    x.drawImage(src, bx.x, bx.y, bx.w, bx.h, -w / 2, -h / 2, w, h);
+    x.setTransform(1, 0, 0, 1, 0, 0);
     const g = toGray(x, w, h);
-    const integ = new Float64Array((w + 1) * (h + 1));
-    for (let y = 0; y < h; y++) {
-      let row = 0;
-      for (let xx = 0; xx < w; xx++) { row += g[y * w + xx]; integ[(y + 1) * (w + 1) + xx + 1] = integ[y * (w + 1) + xx + 1] + row; }
+
+    // Beleuchtungsausgleich: Schatten und Verläufe verschwinden, Papier wird gleichmäßig hell
+    const bg = background(g, w, h);
+    const n = new Uint8ClampedArray(w * h);
+    for (let i = 0; i < n.length; i++) n[i] = Math.min(255, g[i] * 255 / Math.max(8, bg[i]));
+    // Kontrast spreizen: dunkelste 0,5 % → Schwarz, Papier → Weiß; Gamma dunkelt blasse Schrift nach
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < n.length; i++) hist[n[i]]++;
+    const pct = q => { let acc = 0; const lim = n.length * q; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= lim) return v; } return 255; };
+    const lo = pct(.005), hi = Math.max(lo + 20, pct(.5) - 6);
+    const lut = new Uint8ClampedArray(256);
+    for (let v = 0; v < 256; v++) { const t = Math.max(0, Math.min(1, (v - lo) / (hi - lo))); lut[v] = Math.round(255 * Math.pow(t, 1.6)); }
+    for (let i = 0; i < n.length; i++) n[i] = lut[n[i]];
+
+    // Fenster etwa zwei Zeichenhöhen; Zeichen sind bei 1400 px Bonbreite rund 30 px hoch
+    const bin = sauvola(n, w, h, Math.max(25, Math.round(w / 22)) | 1, .2);
+    clearBorder(bin, w, h);
+    const reg = opts.noRegion ? null : textRegion(bin, w, h);
+    const out = opts.mode === 'gray' ? n : bin;
+    const img = x.createImageData(w, h), o = img.data;
+    for (let i = 0, j = 0; i < out.length; i++, j += 4) { o[j] = o[j + 1] = o[j + 2] = out[i]; o[j + 3] = 255; }
+    x.putImageData(img, 0, 0);
+    if (reg && reg.w * reg.h < w * h * .97) {
+      const c2 = canvasOf(reg.w, reg.h);
+      c2.getContext('2d').drawImage(c, reg.x, reg.y, reg.w, reg.h, 0, 0, reg.w, reg.h);
+      c2.angle = angle;
+      return c2;
     }
-    const s = Math.max(15, Math.round(w / 14)) >> 1, T = .14;
-    const out = x.createImageData(w, h), o = out.data;
-    for (let y = 0; y < h; y++) {
-      const y1 = Math.max(0, y - s), y2 = Math.min(h - 1, y + s);
-      for (let xx = 0; xx < w; xx++) {
-        const x1 = Math.max(0, xx - s), x2 = Math.min(w - 1, xx + s);
-        const count = (x2 - x1 + 1) * (y2 - y1 + 1);
-        const sum = integ[(y2 + 1) * (w + 1) + x2 + 1] - integ[y1 * (w + 1) + x2 + 1] - integ[(y2 + 1) * (w + 1) + x1] + integ[y1 * (w + 1) + x1];
-        const v = g[y * w + xx] * count <= sum * (1 - T) ? 0 : 255;
-        const i = (y * w + xx) * 4;
-        o[i] = o[i + 1] = o[i + 2] = v; o[i + 3] = 255;
-      }
-    }
-    x.putImageData(out, 0, 0);
+    c.angle = angle;
     return c;
   }
 
   // ------------------------------------------------------------ Erkennen
+  // Ergebnis mit Zeilen: Text, Sicherheit (0–100) und Lage im aufbereiteten Bild, damit unsichere Zeilen gezeigt werden können
+  async function runOcr(w, img) {
+    const r = await w.recognize(img, {}, { text: true, blocks: true });
+    const lines = [];
+    for (const b of r.data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) {
+      const words = l.words || [];
+      lines.push({
+        text: (l.text || '').replace(/\n/g, ' ').trim(),
+        conf: Math.round(l.confidence || 0),
+        minWord: words.length ? Math.round(Math.min(...words.map(x => x.confidence))) : 0,
+        bbox: l.bbox
+      });
+    }
+    const good = lines.filter(l => l.text);
+    const conf = good.length ? good.reduce((s, l) => s + l.conf * l.text.length, 0) / good.reduce((s, l) => s + l.text.length, 0) : 0;
+    return { lines: good, text: good.map(l => l.text).join('\n'), confidence: Math.round(conf), image: img };
+  }
+
+  // Zwei Durchgänge: Schwarz-Weiß-Bild und kontrastverstärktes Graubild. Die App wählt danach das Ergebnis,
+  // das besser zum Bon passt (Summe stimmt, weniger unsichere Zeilen), und kann beide Zeile für Zeile vergleichen.
   async function recognize(src, onProgress) {
-    const prepared = prepare(src);
     const w = await getWorker();
-    jobLogger = p => onProgress && onProgress(p);
+    let step = 0;
+    jobLogger = p => onProgress && onProgress(Math.min(1, (step + p) / 2));
     try {
-      const r = await w.recognize(prepared);
-      return { text: r.data.text || '', confidence: r.data.confidence };
+      const a = await runOcr(w, prepare(src));
+      step = 1;
+      if (a.confidence >= 90) { onProgress && onProgress(1); return [a]; }
+      const b = await runOcr(w, prepare(src, { mode: 'gray' }));
+      return [a, b];
     } finally { jobLogger = null; }
+  }
+
+  // Ausschnitt einer Zeile als kleines Bild (für die Rückfrage beim Nutzer)
+  function lineCrop(img, bbox) {
+    if (!img || !bbox) return null;
+    const pad = 6, x0 = Math.max(0, bbox.x0 - pad), y0 = Math.max(0, bbox.y0 - pad);
+    const x1 = Math.min(img.width, bbox.x1 + pad), y1 = Math.min(img.height, bbox.y1 + pad);
+    const sc = Math.min(1, 700 / (x1 - x0));
+    const c = canvasOf((x1 - x0) * sc, (y1 - y0) * sc);
+    c.getContext('2d').drawImage(img, x0, y0, x1 - x0, y1 - y0, 0, 0, c.width, c.height);
+    return c.toDataURL('image/png');
   }
 
   // ------------------------------------------------------------ Kamera
@@ -254,6 +486,7 @@
     get state() { return Object.assign({}, state); },
     onState(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     warmup: () => getWorker().catch(() => {}),
-    recognize, prepare, startCamera, stopCamera, captureFrame, fileToCanvas, thumbBlob, torchSupported, setTorch
+    _run: async img => runOcr(await getWorker(), img),
+    recognize, prepare, lineCrop, startCamera, stopCamera, captureFrame, fileToCanvas, thumbBlob, torchSupported, setTorch
   };
 })();
