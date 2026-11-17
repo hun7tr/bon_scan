@@ -1,0 +1,61 @@
+# Lädt die Texterkennung (Tesseract.js, Kern, deutsches Sprachmodell) einmalig von npm und legt sie unter vendor/ ab,
+# damit die App sie von GitHub Pages lädt und offline arbeiten kann. Läuft bei jedem Push, ändert aber nur etwas,
+# wenn vendor/ fehlt oder die Versionen in diesem Skript geändert wurden.
+name: Texterkennung bereitstellen
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    env:
+      TJS: "7.0.0"
+      CORE: "7.0.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Prüfen, ob schon vorhanden
+        id: check
+        run: |
+          if [ -f vendor/VERSION ] && [ "$(cat vendor/VERSION)" = "tjs-$TJS core-$CORE deu-best_int" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Pakete holen
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          set -e
+          rm -rf vendor && mkdir -p vendor/tesseract vendor/tesseract-core vendor/lang /tmp/pk && cd /tmp/pk
+          npm pack "tesseract.js@$TJS" "tesseract.js-core@$CORE" "@tesseract.js-data/deu" >/dev/null
+          for f in *.tgz; do mkdir -p "x-$f" && tar -xzf "$f" -C "x-$f"; done
+          cd "$GITHUB_WORKSPACE"
+          cp "/tmp/pk/x-tesseract.js-$TJS.tgz/package/dist/tesseract.min.js" vendor/tesseract/
+          cp "/tmp/pk/x-tesseract.js-$TJS.tgz/package/dist/worker.min.js" vendor/tesseract/
+          # nur die LSTM-Varianten des Kerns werden gebraucht
+          find "/tmp/pk/x-tesseract.js-core-$CORE.tgz/package" -maxdepth 1 -name 'tesseract-core*lstm*' -exec cp {} vendor/tesseract-core/ \;
+          cp "$(find /tmp/pk/x-tesseract.js-data-deu-*/package -path '*4.0.0_best_int*' -name 'deu.traineddata.gz' | head -1)" vendor/lang/
+          ls -la vendor/*
+          test -s vendor/tesseract/tesseract.min.js
+          test -s vendor/tesseract/worker.min.js
+          test -s vendor/lang/deu.traineddata.gz
+          test -n "$(ls vendor/tesseract-core)"
+          # Dateiliste für den Service Worker
+          (cd vendor && find . -type f ! -name files.json ! -name VERSION | sed 's|^\./|vendor/|' | sort | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.stringify(s.trim().split("\n"),null,1)))') > vendor/files.json
+          echo "tjs-$TJS core-$CORE deu-best_int" > vendor/VERSION
+      - name: Einchecken
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add vendor
+          git commit -m "Texterkennung für Offline-Betrieb bereitgestellt (tesseract.js $TJS)" || exit 0
+          git push
