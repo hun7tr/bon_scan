@@ -2,7 +2,7 @@
 (function () {
 
   // ------------------------------------------------------------ Konstanten
-  const VERSION = '0.3';
+  const VERSION = '0.4';
   const THEMES = { hell: { bar: '#F0EEE9', name: 'Hell' }, dunkel: { bar: '#161617', name: 'Dunkel' } };
   const D = window.BON_DATA, P = window.BonParser, OCR = window.BonOCR;
   const TRASH_DAYS = 30, DAY = 864e5, HOLD_MS = 1000;

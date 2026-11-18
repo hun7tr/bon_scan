@@ -97,63 +97,72 @@
     return thr;
   }
 
-  // Papier vom Hintergrund trennen. Spalten: überwiegend hell. Zeilen: innerhalb dieser Spalten überwiegend hell.
+  // Papier vom Hintergrund trennen, robust gegen Schatten: je Spalte zählt die Helligkeit des hellsten Viertels
+  // (ein Schatten deckt selten die ganze Spalte), die Schwelle zwischen Papier und Hintergrund kommt aus Otsu.
   function findPaper(src) {
     const sw = 200, sh = Math.max(40, Math.round(src.height * sw / src.width));
     const c = canvasOf(sw, sh), x = c.getContext('2d', { willReadFrequently: true });
-    x.filter = 'blur(2px)';
+    x.filter = 'blur(1.5px)';
     x.drawImage(src, 0, 0, sw, sh);
-    const g = toGray(x, sw, sh), t = otsu(g);
-    const bright = i => g[i] > t;
-    const span = (arr, lim) => {
-      const mid = Math.floor(arr.length / 2);
-      let a = mid, b = mid;
-      if (arr[mid] < lim) {
-        let best = -1; arr.forEach((v, i) => { if (v >= lim && (best < 0 || Math.abs(i - mid) < Math.abs(best - mid))) best = i; });
-        if (best < 0) return null;
-        a = b = best;
-      }
-      // kleine Lücken (Knicke, dunkle Zeilen) überbrücken
-      const ok = i => arr[i] >= lim || (arr[i - 1] >= lim && arr[i + 1] >= lim);
-      while (a > 0 && ok(a - 1)) a--;
-      while (b < arr.length - 1 && ok(b + 1)) b++;
+    const g = toGray(x, sw, sh);
+    const pctOf = (vals, q) => { vals.sort((p, r) => p - r); return vals[Math.floor((vals.length - 1) * q)]; };
+    const otsuArr = arr => { const a = new Uint8ClampedArray(arr.length); arr.forEach((v, i) => { a[i] = v; }); return otsu(a); };
+    const span = (ok, n) => {
+      const mid = Math.floor(n / 2);
+      let c0 = mid;
+      if (!ok(mid)) { let best = -1; for (let i = 0; i < n; i++) if (ok(i) && (best < 0 || Math.abs(i - mid) < Math.abs(best - mid))) best = i; if (best < 0) return null; c0 = best; }
+      let a = c0, b = c0;
+      const okg = i => ok(i) || (i > 0 && i < n - 1 && (ok(i - 1) || ok(i - 2)) && (ok(i + 1) || ok(i + 2)));
+      while (a > 0 && okg(a - 1)) a--;
+      while (b < n - 1 && okg(b + 1)) b++;
       return [a, b];
     };
-    const col = new Array(sw).fill(0);
-    for (let y = 0; y < sh; y++) for (let xx = 0; xx < sw; xx++) if (bright(y * sw + xx)) col[xx]++;
-    const cs = span(col.map(v => v / sh), .4);
+    const col = [];
+    for (let xx = 0; xx < sw; xx++) { const v = []; for (let y = 0; y < sh; y++) v.push(g[y * sw + xx]); col.push(pctOf(v, .75)); }
+    const tc = otsuArr(col);
+    const cs = span(i => col[i] > tc, sw);
     if (!cs) return null;
-    const row = new Array(sh).fill(0), cw = cs[1] - cs[0] + 1;
-    for (let y = 0; y < sh; y++) for (let xx = cs[0]; xx <= cs[1]; xx++) if (bright(y * sw + xx)) row[y]++;
-    const rs = span(row.map(v => v / cw), .6);
+    const row = [];
+    for (let y = 0; y < sh; y++) { const v = []; for (let xx = cs[0]; xx <= cs[1]; xx++) v.push(g[y * sw + xx]); row.push(pctOf(v, .75)); }
+    const tr = otsuArr(row);
+    // Zeilen: wenn der Bon fast das ganze Bild füllt, liefert Otsu keine sinnvolle Grenze → ganze Höhe
+    const rs = Math.max(...row) - Math.min(...row) < 30 ? [0, sh - 1] : span(i => row[i] > tr, sh);
     if (!rs) return null;
     const fx = src.width / sw, fy = src.height / sh;
-    const box = { x: cs[0] * fx, y: rs[0] * fy, w: cw * fx, h: (rs[1] - rs[0] + 1) * fy };
-    if (box.w * box.h < src.width * src.height * .08) return null;
-    const m = Math.round(box.w * .03);
-    box.x = Math.max(0, box.x - m); box.y = Math.max(0, box.y - m);
-    box.w = Math.min(src.width - box.x, box.w + 2 * m); box.h = Math.min(src.height - box.y, box.h + 2 * m);
+    const box = { x: cs[0] * fx, y: rs[0] * fy, w: (cs[1] - cs[0] + 1) * fx, h: (rs[1] - rs[0] + 1) * fy };
+    if (box.w * box.h < src.width * src.height * .06) return null;
+    // großzügiger Rand: ein Schatten am Papierrand darf keine Preise oder Zeilenanfänge abschneiden;
+    // den genauen Textbereich bestimmt danach textRegion()
+    const mx = Math.round(box.w * .2), my = Math.round(box.h * .04);
+    box.x = Math.max(0, box.x - mx); box.y = Math.max(0, box.y - my);
+    box.w = Math.min(src.width - box.x, box.w + 2 * mx); box.h = Math.min(src.height - box.y, box.h + 2 * my);
     return box;
   }
 
-  // Schräglage schätzen: bei richtigem Winkel bilden die Textzeilen scharfe Spitzen im Zeilenprofil
+  // Schräglage schätzen: nur Schriftpixel (lokale Schwelle, Randflächen entfernt), bei richtigem Winkel bilden
+  // die Textzeilen scharfe Spitzen im Zeilenprofil. Erst grob in 0,5°-Schritten, dann fein in 0,1°-Schritten.
   function estimateSkew(src, bx) {
-    const sw = 420, sh = Math.max(40, Math.round(bx.h * sw / bx.w));
+    const sw = 600, sh = Math.max(40, Math.round(bx.h * sw / bx.w));
     const c = canvasOf(sw, sh), x = c.getContext('2d', { willReadFrequently: true });
     x.drawImage(src, bx.x, bx.y, bx.w, bx.h, 0, 0, sw, sh);
-    const g = toGray(x, sw, sh), t = otsu(g) * .85;
+    const g = toGray(x, sw, sh);
+    const bin = sauvola(g, sw, sh, 31, .3);
+    clearBorder(bin, sw, sh);
     const pts = [];
-    for (let y = 0; y < sh; y++) for (let xx = 0; xx < sw; xx++) if (g[y * sw + xx] < t) pts.push(xx - sw / 2, y);
-    if (pts.length < 200) return 0;
-    let best = 0, bestScore = -1;
-    for (let a = -6; a <= 6.001; a += .25) {
-      const tan = Math.tan(a * Math.PI / 180), hist = new Float32Array(sh + 400);
-      for (let i = 0; i < pts.length; i += 2) { const yy = Math.round(pts[i + 1] + pts[i] * tan) + 200; if (yy >= 0 && yy < hist.length) hist[yy]++; }
-      let score = 0;
-      for (let i = 1; i < hist.length; i++) { const d = hist[i] - hist[i - 1]; score += d * d; }
-      if (score > bestScore) { bestScore = score; best = a; }
-    }
-    return best;
+    for (let y = 0; y < sh; y++) for (let xx = 0; xx < sw; xx++) if (bin[y * sw + xx] === 0) pts.push(xx - sw / 2, y);
+    if (pts.length < 300) return 0;
+    const score = a => {
+      const tan = Math.tan(a * Math.PI / 180), off = Math.ceil(sw / 2 * Math.abs(Math.tan(12 * Math.PI / 180))) + 2, hist = new Float32Array(sh + 2 * off);
+      for (let i = 0; i < pts.length; i += 2) { const yy = Math.round(pts[i + 1] + pts[i] * tan) + off; if (yy >= 0 && yy < hist.length) hist[yy]++; }
+      let s = 0;
+      for (let i = 1; i < hist.length; i++) { const d = hist[i] - hist[i - 1]; s += d * d; }
+      return s;
+    };
+    let best = 0, bs = -1;
+    for (let a = -12; a <= 12.001; a += .5) { const v = score(a); if (v > bs) { bs = v; best = a; } }
+    const coarse = best;
+    for (let a = coarse - .5; a <= coarse + .501; a += .1) { const v = score(a); if (v > bs) { bs = v; best = a; } }
+    return Math.round(best * 10) / 10;
   }
 
   // Beleuchtung schätzen: hellster Wert je Block (das Papier), geglättet und wieder auf volle Größe gebracht
@@ -218,6 +227,13 @@
     return out;
   }
 
+  function boxBlur(a, w, h, r) {
+    const t = new Float32Array(w * h), o = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) { let s = 0; for (let x = -r; x <= r; x++) s += a[y * w + Math.min(w - 1, Math.max(0, x))]; for (let x = 0; x < w; x++) { t[y * w + x] = s / (2 * r + 1); s += a[y * w + Math.min(w - 1, x + r + 1)] - a[y * w + Math.max(0, x - r)]; } }
+    for (let x = 0; x < w; x++) { let s = 0; for (let y = -r; y <= r; y++) s += t[Math.min(h - 1, Math.max(0, y)) * w + x]; for (let y = 0; y < h; y++) { o[y * w + x] = s / (2 * r + 1); s += t[Math.min(h - 1, y + r + 1) * w + x] - t[Math.max(0, y - r) * w + x]; } }
+    return o;
+  }
+
   // schwarze Flächen, die den Bildrand berühren (Tisch, Hand, Schatten am Rand), entfernen
   function clearBorder(bin, w, h) {
     const stack = new Int32Array(w * h);
@@ -275,7 +291,7 @@
     const hs = texty.map(c => c.ch).sort((a, b) => a - b), h0 = hs[hs.length >> 1];
     const C = Math.max(20, h0 * 3), cw2 = Math.ceil(w / C), chh = Math.ceil(h / C), dens = new Uint16Array(cw2 * chh);
     texty.forEach(c => dens[Math.floor((c.y0 + c.y1) / 2 / C) * cw2 + Math.floor((c.x0 + c.x1) / 2 / C)]++);
-    const seen = new Uint8Array(dens.length);
+    const seen = new Uint8Array(dens.length), clusters = [];
     let best = null;
     for (let s0 = 0; s0 < dens.length; s0++) {
       if (dens[s0] < 2 || seen[s0]) continue;
@@ -293,9 +309,15 @@
           if (!seen[j] && dens[j] >= 2) { seen[j] = 1; q.push(j); }
         }
       }
+      clusters.push({ cnt, x0, y0, x1, y1 });
       if (!best || cnt > best.cnt) best = { cnt, x0, y0, x1, y1 };
     }
     if (!best) return null;
+    // ein Bon hat mehrere Textblöcke (Kopf, Artikel, Summe, Steuer, Datum): alle nennenswerten Blöcke vereinen
+    const big = clusters.filter(c => c.cnt >= Math.max(6, best.cnt * .08));
+    best = { cnt: best.cnt, x0: Math.min(...big.map(c => c.x0)), y0: Math.min(...big.map(c => c.y0)), x1: Math.max(...big.map(c => c.x1)), y1: Math.max(...big.map(c => c.y1)) };
+    // Spalten nebeneinander (Name links, Preis rechts) gehören dazu: alle Textzellen in derselben Höhe einschließen
+    for (let cy = best.y0; cy <= best.y1; cy++) for (let cx = 0; cx < cw2; cx++) if (dens[cy * cw2 + cx] >= 1) { best.x0 = Math.min(best.x0, cx); best.x1 = Math.max(best.x1, cx); }
     const m = Math.round(h0 * 1.2);
     const r = { x: Math.max(0, best.x0 * C - m), y: Math.max(0, best.y0 * C - m) };
     r.w = Math.min(w, (best.x1 + 1) * C + m) - r.x;
@@ -318,8 +340,8 @@
     const box = opts.noTrim ? null : findPaper(src);
     const bx = box || { x: 0, y: 0, w: src.width, h: src.height };
     const angle = opts.noDeskew ? 0 : estimateSkew(src, bx);
-    let scale = 1400 / bx.w;
-    scale = Math.max(.35, Math.min(2.5, scale));
+    let scale = (opts.targetW || 1400) / bx.w;
+    scale = Math.max(.35, Math.min(opts.maxUp || 4, scale));
     if (bx.h * scale > 9000) scale = 9000 / bx.h;
     const w = Math.round(bx.w * scale), h = Math.round(bx.h * scale);
     const c = canvasOf(w, h), x = c.getContext('2d', { willReadFrequently: true });
@@ -327,7 +349,7 @@
     x.fillRect(0, 0, w, h);
     x.imageSmoothingQuality = 'high';
     x.translate(w / 2, h / 2);
-    x.rotate(-angle * Math.PI / 180);
+    x.rotate(angle * Math.PI / 180);
     x.drawImage(src, bx.x, bx.y, bx.w, bx.h, -w / 2, -h / 2, w, h);
     x.setTransform(1, 0, 0, 1, 0, 0);
     const g = toGray(x, w, h);
@@ -342,13 +364,21 @@
     const pct = q => { let acc = 0; const lim = n.length * q; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= lim) return v; } return 255; };
     const lo = pct(.005), hi = Math.max(lo + 20, pct(.5) - 6);
     const lut = new Uint8ClampedArray(256);
-    for (let v = 0; v < 256; v++) { const t = Math.max(0, Math.min(1, (v - lo) / (hi - lo))); lut[v] = Math.round(255 * Math.pow(t, 1.6)); }
+    const gamma = opts.gamma || 1.6;
+    for (let v = 0; v < 256; v++) { const t = Math.max(0, Math.min(1, (v - lo) / (hi - lo))); lut[v] = Math.round(255 * Math.pow(t, gamma)); }
     for (let i = 0; i < n.length; i++) n[i] = lut[n[i]];
+    // Schärfen (Unschärfemaske): hilft bei verwackelten und hochskalierten Fotos
+    if (opts.sharpen) {
+      const r = Math.max(1, Math.round(w / 500)), bl = boxBlur(n, w, h, r), amt = opts.sharpen;
+      for (let i = 0; i < n.length; i++) n[i] = n[i] + amt * (n[i] - bl[i]);
+    }
 
     // Fenster etwa zwei Zeichenhöhen; Zeichen sind bei 1400 px Bonbreite rund 30 px hoch
-    const bin = sauvola(n, w, h, Math.max(25, Math.round(w / 22)) | 1, .2);
+    const bin = sauvola(n, w, h, Math.max(25, Math.round(w / 22)) | 1, opts.k || .2);
     clearBorder(bin, w, h);
-    const reg = opts.noRegion ? null : textRegion(bin, w, h);
+    let reg = opts.noRegion ? null : textRegion(bin.slice(), w, h);
+    // nur übernehmen, wenn der Textbereich den Großteil des Bons umfasst (sonst wurde z. B. nur eine Trennlinie gefunden)
+    if (reg && (reg.h < h * .5 || reg.w < w * .55)) reg = null;
     const out = opts.mode === 'gray' ? n : bin;
     const img = x.createImageData(w, h), o = img.data;
     for (let i = 0, j = 0; i < out.length; i++, j += 4) { o[j] = o[j + 1] = o[j + 2] = out[i]; o[j + 3] = 255; }
@@ -389,10 +419,11 @@
     let step = 0;
     jobLogger = p => onProgress && onProgress(Math.min(1, (step + p) / 2));
     try {
-      const a = await runOcr(w, prepare(src));
+      // zuerst das kontrastverstärkte Graubild (im Test mit 100 Bons das bessere), dann Schwarz-Weiß
+      const a = await runOcr(w, prepare(src, { mode: 'gray' }));
       step = 1;
       if (a.confidence >= 90) { onProgress && onProgress(1); return [a]; }
-      const b = await runOcr(w, prepare(src, { mode: 'gray' }));
+      const b = await runOcr(w, prepare(src));
       return [a, b];
     } finally { jobLogger = null; }
   }
@@ -487,6 +518,7 @@
     onState(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     warmup: () => getWorker().catch(() => {}),
     _run: async img => runOcr(await getWorker(), img),
+    _variants: async (src, list) => { const w = await getWorker(); const out = []; for (const o of list) { const r = await runOcr(w, prepare(src, o)); out.push({ conf: r.confidence, lines: r.lines }); } return out; },
     recognize, prepare, lineCrop, startCamera, stopCamera, captureFrame, fileToCanvas, thumbBlob, torchSupported, setTorch
   };
 })();

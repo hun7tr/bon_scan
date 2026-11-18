@@ -28,7 +28,7 @@
   const QTY = /^(\d{1,3})\s*(?:STK|ST|STUCK|STÜCK|STCK)?\.?\s*[xX×*]\.?\s*(\d{1,4},\d{2})(?:\s*(?:EUR|€))?(?:\s+(-?\d{1,4},\d{2}))?/i;
   const QTY_INLINE = /(?:^|\s)(\d{1,3})\s*(?:STK|ST)?\.?\s*[xX×*]\.?\s*(\d{1,4},\d{2})(?=\s|$)|^(\d{1,3})\s*[xX×*]\s+(?=[A-Za-zÄÖÜäöü])/i;
   // Gewicht: „0,512 kg x 2,99 EUR/kg“, „1,234 kg * 1,99 €/kg“
-  const WEIGHT = /(\d{1,3}[,.]\d{1,3})\s*KG\s*[xX×*@]?\s*(\d{1,4},\d{2})\s*(?:EUR|€)?\s*\/\s*KG(?:\s+(-?\d{1,4},\d{2}))?/i;
+  const WEIGHT = /(\d{1,3}[,.]\d{1,4})\s*[KkB][GgQq9]\s*[xX×*@]?\s*(\d{1,4},\d{2})\s*(?:[A-Z€]{2,3})?\s*\/\s*[KkB][GgQqO09]?(?:\s+(-?\d{1,4},\d{2}))?/i;
   // Gewicht in der Artikelzeile ohne Kilopreis: „Bananen Bio 0,484 kg 0,77 B“
   const WEIGHT_INLINE = /\s(\d{1,3}[,.]\d{3})\s*kg\b/i;
   const HAND = /HANDEINGABE|HAND EINGABE|WAAGE|WAEGEN/i;
@@ -111,7 +111,14 @@
     };
     const head = scan(lines.slice(0, 12));
     if (head) return head;
-    return scan(lines);
+    const any = scan(lines);
+    if (any) return any;
+    // unbekannter Markt: die erste Kopfzeile, die wie ein Name aussieht (überwiegend Buchstaben, keine Adresse)
+    for (const l of lines.slice(0, 4)) {
+      const t = l.trim(), letters = (t.match(/[A-Za-zÄÖÜäöüß]/g) || []).length;
+      if (letters >= 4 && letters / t.replace(/\s/g, '').length > .8 && !/\d{3,}|STR\.|STRASSE|GMBH|TEL/i.test(t)) return prettyName(t).slice(0, 40);
+    }
+    return null;
   }
 
   function fixPart(str, min, max) {
@@ -196,6 +203,91 @@
   }
   const cap = w => w.charAt(0) + w.slice(1).toLowerCase();
 
+  // ------------------------------------------------------------ Produkt-Wörterbuch (products.js, confusions.js)
+  // Mengenangaben („500g“, „1,5L“, „10St“, „4x“) gehören nicht zum Produktnamen; sie werden getrennt und
+  // mit typischen Lesefehlern repariert („50O9“ → „500g“).
+  const SIZE_RE = /^[\dOoIlSZB]{1,4}([,.][\dOoIlSZB]{1,3})?\s?(g|9|kg|k9|l|L|1|ml|m1|cl|St|5t|st|Stk|er|x|%)$/;
+  function splitSize(name) {
+    const toks = String(name || '').split(/\s+/).filter(Boolean), core = [], size = [];
+    toks.forEach((t, i) => {
+      if (i > 0 && /\d/.test(t) && SIZE_RE.test(t)) {
+        let num = t.match(/^[\dOoIlSZB]{1,4}([,.][\dOoIlSZB]{1,3})?/)[0], unit = t.slice(num.length).trim();
+        num = num.replace(/[Oo]/g, '0').replace(/[Il]/g, '1').replace(/S/g, '5').replace(/Z/g, '2').replace(/B/g, '8');
+        unit = ({ 9: 'g', k9: 'kg', 1: 'L', m1: 'ml', '5t': 'St', st: 'St', l: 'L' })[unit] || unit;
+        size.push(num + unit);
+      } else core.push(t);
+    });
+    return { core: core.join(' '), size: size.join(' ') };
+  }
+  let LEX = null;
+  function lexicon() {
+    if (LEX) return LEX;
+    const list = root.BON_PRODUCTS || [];
+    LEX = list.map(e => { const sp = splitSize(e.name); return { name: e.name, cat: e.cat, core: norm(sp.core), size: sp.size }; }).filter(e => e.core.length >= 3);
+    return LEX;
+  }
+  // Abstand mit gelernten Verwechslungskosten (Ersetzen häufiger Paare ist billiger)
+  function wlev(a, b, max) {
+    const C = root.BON_CONFUSIONS || {};
+    if (Math.abs(a.length - b.length) > max) return max + 1;
+    let prev = new Float32Array(b.length + 1);
+    for (let j = 0; j <= b.length; j++) prev[j] = j;
+    for (let i = 1; i <= a.length; i++) {
+      const cur = new Float32Array(b.length + 1);
+      cur[0] = i;
+      let best = cur[0];
+      for (let j = 1; j <= b.length; j++) {
+        const x = a[i - 1], y = b[j - 1];
+        const sub = x === y ? 0 : (C[y + x] || C[x + y] || 1);
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + sub);
+        if (cur[j] < best) best = cur[j];
+      }
+      if (best > max) return max + 1;
+      prev = cur;
+    }
+    return prev[b.length];
+  }
+  // bestes Wörterbuchprodukt für einen gelesenen Namen. Verglichen wird ein Fenster aus aufeinanderfolgenden
+  // Wörtern (Leerzeichen zählen nicht), so bleiben Zusätze wie Marke oder „Bund“ erhalten und nur das
+  // verstümmelte Wort wird ersetzt. Nur eindeutige Treffer zählen.
+  function matchProduct(name) {
+    const toks = String(name || '').split(/[\s.]+/).filter(Boolean);
+    const words = [];
+    toks.forEach((t, i) => { if (!(i > 0 && /\d/.test(t) && SIZE_RE.test(t))) words.push({ t, i, n: norm(t).replace(/ /g, '') }); });
+    if (!words.length) return null;
+    const cands = [];
+    for (const e of lexicon()) {
+      const ec = e.core.replace(/ /g, ''), ew = e.core.split(' ').length;
+      let bestW = null;
+      for (let k = Math.max(1, ew - 1); k <= Math.min(words.length, ew + 1); k++) {
+        for (let st = 0; st + k <= words.length; st++) {
+          const q = words.slice(st, st + k).map(w => w.n).join('');
+          if (q.length < 3) continue;
+          const max = Math.max(1, ec.length * .34);
+          const d = wlev(q, ec, max);
+          if (d <= max && (!bestW || d < bestW.d || (d === bestW.d && k > bestW.k))) bestW = { d, k, st, q };
+        }
+      }
+      if (bestW) cands.push({ e, ...bestW, len: ec.length });
+    }
+    if (!cands.length) return null;
+    // am besten: kleinster relativer Abstand, bei Gleichstand das längere Produkt (deckt mehr ab)
+    cands.sort((x, y) => (x.d / x.len - y.d / y.len) || (y.len - x.len));
+    const best = cands[0];
+    const rival = cands.find(c => c.e.core !== best.e.core && !best.e.core.includes(c.e.core) && !c.e.core.includes(best.e.core));
+    if (best.d > 0 && rival && rival.d / rival.len - best.d / best.len < .06) return null;
+    // Namen zusammensetzen: Fensterwörter durch den Wörterbuchnamen ersetzen, Rest behalten
+    const win = words.slice(best.st, best.st + best.k).map(w => w.i);
+    const out = [];
+    let placed = false;
+    const sizes = splitSize(best.e.name);
+    toks.forEach((t, i) => {
+      if (win.includes(i)) { if (!placed) { out.push(sizes.core); placed = true; } }
+      else out.push(t);
+    });
+    return { entry: best.e, dist: best.d, rel: best.d / best.len, name: out.join(' '), covered: best.k === words.length };
+  }
+
   // ------------------------------------------------------------ Bon auslesen
   // text: erkannter Text. opts.lines: Zeilen der Texterkennung mit Sicherheit (conf, minWord) und Lage (bbox).
   // Jeder Artikel bekommt check: Liste offener Punkte ('lesen' = unsicher gelesen, 'preis' = Preis fehlt oder angeglichen,
@@ -207,14 +299,16 @@
       : String(text || '').split(/\r?\n/).map(t => ({ raw: t }));
     const L = src.map((l, i) => Object.assign(l, { i, t: fixNumbers(l.raw.replace(/\t/g, ' ').replace(/\s+/g, ' ').trim()) })).filter(l => l.t.length > 1);
     const lines = L.map(l => l.t);
-    const items = [], unread = [];
+    const items = [], unread = [], maybe = [];
     let total = null, totalFound = false;
     let pending = null, pendingQty = null;
     const running = () => round2(items.reduce((s, it) => s + (it.price || 0), 0));
     const last = () => items[items.length - 1];
     const letterCount = s => (s.match(/[A-Za-zÄÖÜäöü]/g) || []).length;
     const push = (lo, raw, price, extra) => {
-      if (pending && pending !== lo && items.length) unread.push(pending);
+      if (pending && pending !== lo && items.length) maybe.push(pending);
+      // nicht verstandene Zeilen zwischen zwei Artikeln gehören zum Artikelblock
+      unread.push(...maybe.splice(0));
       const it = Object.assign({ raw: cleanName(raw), name: prettyName(raw), price: round2(price), qty: 1, line: lo.i, conf: lo.conf, minWord: lo.minWord, bbox: lo.bbox }, extra || {});
       if (pendingQty && !pendingQty.kgOnly && !(extra && extra.qty)) { it.qty = pendingQty.qty; it.unit = pendingQty.unit; pendingQty = null; }
       items.push(it);
@@ -232,6 +326,17 @@
         if (ep) { total = Math.abs(ep.price); totalFound = true; break; }
         continue;
       }
+      // Trennlinie (----, ====) oder Datum/Uhrzeit nach den Artikeln: Ende der Artikel
+      const compact = line.replace(/\s/g, '');
+      if (items.length >= 1 && compact.length >= 8 && (compact.match(/[-=_~.—–]/g) || []).length / compact.length > .6) {
+        // die Summe steht meist direkt danach
+        for (let j = k + 1; j < Math.min(L.length, k + 4); j++) {
+          const nj = norm(L[j].t), ep = endPrice(L[j].t);
+          if (ep && (isTotalLine(nj) || Math.abs(Math.abs(ep.price) - running()) < 0.011)) { total = Math.abs(ep.price); totalFound = true; break; }
+        }
+        break;
+      }
+      if (items.length >= 2 && /\d{1,2}[.,]\d{2}[.,]\d{2,4}\s+\d{1,2}:\d{2}/.test(line)) break;
       // Zahlungsteil (Karte, Bar, Steuer …): Ende der Artikel
       if (items.length && PAY_WORDS.test(n)) {
         const ep = endPrice(line);
@@ -252,6 +357,9 @@
         continue;
       }
 
+      // Gewichtszeile, die nicht sauber gelesen wurde („2,0933 kg x“): nie ein eigener Artikel
+      if (/\d\s*[KkB][GgQq9]\s*[xX×*]/.test(line) || /EUR\s*\/\s*[KkB][GgQq9]/i.test(line)) continue;
+
       // reine Mengenzeile
       const q = line.match(QTY);
       if (q && letterCount(line.replace(q[0], '')) < 3) {
@@ -268,7 +376,7 @@
       if (!ep) {
         // Zeile ohne Betrag: Name, dessen Betrag in der nächsten Zeile steht – oder eine nicht verstandene Zeile
         const ok = letterCount(line) >= 3 && !SKIP_WORDS.test(n) && !/^\d{5}\s/.test(line);
-        if (pending && items.length) unread.push(pending);
+        if (pending && items.length) maybe.push(pending);
         pending = ok ? lo : null;
         continue;
       }
@@ -320,7 +428,6 @@
       const it = push(lo, name, price, extra);
       if (pendingQty && pendingQty.kgOnly && !it.kg) { it.kg = pendingQty.kg; it.perKg = pendingQty.perKg; pendingQty = null; }
     }
-    if (pending && items.length) unread.push(pending);
 
     items.forEach(it => { delete it.qtySet; });
     let sum = running();
@@ -353,23 +460,45 @@
 
     const out = [];
     for (const it of items) {
-      // verstümmelte Wörter mit dem Wörterbuch reparieren, aber als geraten kennzeichnen
-      let guessed = false;
-      if (suspicious(it.name)) {
-        const r = repairName(it.name, opts.learned);
-        if (r.changed) { it.raw = cleanName(r.name).toUpperCase(); it.name = prettyName(r.name); guessed = true; }
+      let guessed = false, lexHit = null;
+      const c0 = categorize(it.raw, opts.learned);
+      if (c0.ignore) continue;
+      if (c0.src !== 'learned') {
+        // im Produkt-Wörterbuch nachschlagen: bekannte Produkte werden auch verstümmelt erkannt
+        const m = matchProduct(it.name);
+        if (m) {
+          lexHit = m;
+          if (m.dist > 0) { it.name = prettyName(m.name); guessed = m.rel > .12 || m.dist >= 1.5; it.matched = it.raw; }
+          it.lex = m.entry.name;
+        } else if (suspicious(it.name)) {
+          const r = repairName(it.name, opts.learned);
+          if (r.changed) { it.raw = cleanName(r.name).toUpperCase(); it.name = prettyName(r.name); guessed = true; }
+        }
       }
-      const c = categorize(it.raw, opts.learned);
+      const c = lexHit ? lexCategory(lexHit.entry, opts.learned) : categorize(it.raw, opts.learned);
       if (c.ignore) continue;
       Object.assign(it, c);
+      if (lexHit) it.src = 'lex';
       const check = [];
       const lowConf = it.conf != null && (it.conf < 78 || (it.minWord != null && it.minWord < 55));
-      if (c.src !== 'learned' && (guessed || lowConf || suspicious(it.name) || it.unreadable)) check.push('lesen');
-      if (it.price == null || it.fixed) check.push('preis');
+      // exakte oder fast exakte Treffer im Wörterbuch gelten als sicher gelesen
+      const trusted = c.src === 'learned' || (lexHit && !guessed);
+      if (!trusted && (guessed || lowConf || suspicious(it.name) || it.unreadable)) check.push('lesen');
+      if (it.price == null || it.fixed || (trusted && it.conf != null && it.conf < 70)) check.push('preis');
       if (it.cat === 'unbekannt') check.push('zuordnen');
       if (check.length) it.check = check;
       if (guessed) it.guessed = true;
       out.push(it);
+    }
+    // Zeilen, die nur Lesemüll sind, fallen weg, wenn die Summe des Bons das bestätigt
+    if (totalFound) dropJunk(out, total);
+    // stimmt die Summe der Artikel mit der Bonsumme, sind die Preise bestätigt
+    if (totalFound && Math.abs(out.reduce((t, it) => t + (it.price || 0), 0) - total) < 0.005) {
+      out.forEach(it => {
+        if (!it.check || it.fixed) return;
+        it.check = it.check.filter(c => c !== 'preis');
+        if (!it.check.length) delete it.check;
+      });
     }
     return {
       store: findStore(lines),
@@ -379,6 +508,35 @@
       sum: round2(out.reduce((s, it) => s + (it.price || 0), 0)),
       items: out
     };
+  }
+
+  // Kategorie eines Wörterbucheintrags: Regeln aus data.js für Ernährung usw., Kategorie aus dem Wörterbuch
+  function lexCategory(e, learned) {
+    const c = categorize(e.name, learned);
+    if (c.src === 'learned' || c.cat === e.cat) { if (c.src !== 'learned') delete c.name; return c; }
+    const cat = catByKey(e.cat);
+    const out = { cat: e.cat, diet: cat.d == null ? null : cat.d, conv: !!cat.v, health: cat.h == null ? null : cat.h, src: 'dict' };
+    if (c.cat !== 'unbekannt' && catByKey(c.cat).food !== false && cat.food !== false) { out.diet = c.diet; if (c.health) out.health = c.health; }
+    if (cat.food === false) { out.diet = null; out.health = null; out.conv = false; }
+    return out;
+  }
+
+  // Müll entfernen: nicht im Wörterbuch, unsicher gelesen, und ohne ihn stimmt die Summe (oder er hat keinen Preis)
+  function dropJunk(items, total) {
+    const junk = it => !it.lex && it.src !== 'learned' && it.check && it.check.includes('lesen');
+    const sum = () => round2(items.reduce((s, it) => s + (it.price || 0), 0));
+    const J = items.filter(junk);
+    if (!J.length) return;
+    if (Math.abs(sum() - total) < 0.005) {
+      for (const it of J) if (it.price == null || it.unreadable) items.splice(items.indexOf(it), 1);
+      return;
+    }
+    // alle Müllzeilen mit Preis weg?
+    const withPrice = J.filter(it => it.price != null);
+    const rest = round2(sum() - withPrice.reduce((s, it) => s + it.price, 0));
+    if (withPrice.length && Math.abs(rest - total) < 0.005) { J.forEach(it => items.splice(items.indexOf(it), 1)); return; }
+    // eine einzelne Müllzeile weg?
+    for (const it of withPrice) if (Math.abs(sum() - it.price - total) < 0.005) { items.splice(items.indexOf(it), 1); return; }
   }
 
   // ------------------------------------------------------------ Zuordnung

@@ -2,6 +2,25 @@
 /* Änderungen je Version, neueste oben. Bei jedem Update ergänzen. */
 window.CHANGELOG = [
   {
+    v: '0.4', date: '2026-11-18',
+    title: 'Mit 100 Testbons trainiert: Produkt-Wörterbuch, gelernte Lesefehler und bessere Bildaufbereitung.',
+    added: [
+      'Produkt-Wörterbuch mit über 800 gängigen Supermarktprodukten: verstümmelt gelesene Namen werden erkannt und richtig zugeordnet',
+      'Tabelle typischer Lesefehler, gelernt aus 100 Bons mit bekannter Lösung (z. B. 1 und I, 5 und S)',
+      'Unbekannter Markt: die erste Kopfzeile wird als Name übernommen',
+      'Preise unsicher gelesener Zeilen werden zum Prüfen markiert, außer die Summe des Bons bestätigt sie'
+    ],
+    changed: [
+      'Begradigen dreht schräge Bons jetzt in die richtige Richtung und misst die Schräglage nur an der Schrift',
+      'Papiererkennung robust gegen Schatten, Preisspalte und Zeilenanfänge werden nicht mehr abgeschnitten',
+      'Alle Textblöcke bleiben erhalten, auch Summe und Datum unter den Artikeln',
+      'Kleine Fotos werden stärker vergrößert, das kontrastverstärkte Graubild wird zuerst gelesen',
+      'Trennlinien und Datumszeilen beenden die Artikelliste, Fußzeilen werden nicht mehr als Artikel gezählt',
+      'Lesemüll fällt weg, wenn die Bonsumme das bestätigt'
+    ],
+    removed: []
+  },
+  {
     v: '0.3', date: '2026-11-17',
     title: 'Fehlende Artikel direkt auf dem Bon antippen, Rückgängig und Zuordnungen exportieren.',
     added: [
